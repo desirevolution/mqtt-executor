@@ -128,7 +128,7 @@ sensor:
 			},
 		},
 		{
-			name: "Sensor missing interval",
+			name: "On-demand sensor without interval",
 			content: `
 sensor:
   - name: My sweat sensor
@@ -137,7 +137,15 @@ sensor:
       name: /usr/bin/bash
       arguments: [echo]
 `,
-			expectedError: "invalid config: invalid sensor (#0): invalid duration",
+			expectedResult: TopicConfigurations{
+				Sensor: []Sensor{{
+					Name: "My sweat sensor",
+					GeneralSensor: GeneralSensor{
+						Name: "My sweat sensor", ResultTopic: fmt.Sprintf("tele/%s/status", deviceId),
+						Command: Command{Name: "/usr/bin/bash", Arguments: []string{"echo"}},
+					},
+				}},
+			},
 		},
 		{
 			name: "Sensor missing name",

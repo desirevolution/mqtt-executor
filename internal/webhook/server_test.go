@@ -38,12 +38,11 @@ func newTestServer(t *testing.T) *httptest.Server {
 		Executor:  cmd.NewCommandExecutor(),
 		Publisher: transport.NopPublisher{},
 	}
-	sensor.SetQueryables(map[string]config.GeneralSensor{
-		"mem": {
-			Command:  config.Command{Name: "/bin/echo", Arguments: []string{"42"}},
-			Interval: 1,
-		},
-	})
+	sensor.Initialise(1, []config.GeneralSensor{{
+		Name: "mem", Command: config.Command{Name: "/bin/echo", Arguments: []string{"42"}},
+	}})
+	t.Cleanup(func() { assert.NoError(t, sensor.Close(time.Second)) })
+	t.Cleanup(func() { assert.NoError(t, trigger.Executor.Close(time.Second)) })
 
 	srv := NewServer("", trigger, sensor, time.Now())
 	ts := httptest.NewServer(srv.Handler)
@@ -256,7 +255,7 @@ func TestDocsEndpoints(t *testing.T) {
 
 	//the API surface (must match the mux routes in NewServer)
 	endpoints := []string{
-		"/trigger/{name}", "/trigger/{name}/stop", "/sensor/{name}", "/status", "/metrics",
+		"/trigger/{name}", "/trigger/{name}/run", "/trigger/{name}/stop", "/sensor/{name}", "/status", "/metrics",
 	}
 
 	docs, err := http.Get(ts.URL + "/docs")
@@ -291,4 +290,24 @@ func TestServerCloseImplementsClosable(t *testing.T) {
 	srv := NewServer("", &mqtt.Trigger{}, &mqtt.SensorWorker{}, time.Now())
 	var _ interface{ Close(time.Duration) error } = srv
 	assert.NoError(t, srv.Close(time.Second))
+}
+
+func TestTriggerRunReturnsBeforeCompletionAndRejectsSecondStart(t *testing.T) {
+	ts := newTestServer(t)
+	url := ts.URL + "/trigger/slow"
+
+	resp, err := http.Post(url+"/run", "", nil)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+
+	resp, err = http.Post(url+"/run", "", nil)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusConflict, resp.StatusCode)
+
+	resp, err = http.Post(url+"/stop", "", nil)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }

@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"time"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -31,10 +30,11 @@ type availabilityPayload struct {
 }
 
 type Trigger struct {
-	Name    string  `yaml:"name"`
-	Topic   string  `yaml:"topic"`
-	Icon    string  `yaml:"icon"`
-	Command Command `yaml:"command"`
+	Name     string  `yaml:"name"`
+	Topic    string  `yaml:"topic"`
+	RunTopic string  `yaml:"run_topic"`
+	Icon     string  `yaml:"icon"`
+	Command  Command `yaml:"command"`
 	// StdinPayload: pass the incoming payload (MQTT message body / webhook
 	// request body) to the command as stdin
 	StdinPayload bool `yaml:"stdin_payload"`
@@ -45,6 +45,7 @@ type Trigger struct {
 
 type GeneralSensor struct {
 	ResultTopic string   `yaml:"topic"`
+	QueryTopic  string   `yaml:"query_topic"`
 	Retained    bool     `yaml:"retained"`
 	Interval    Interval `yaml:"interval"`
 	Command     Command  `yaml:"command"`
@@ -56,7 +57,8 @@ type GeneralSensor struct {
 	PublishOnChange bool `yaml:"publish_on_change"`
 	// Name identifies the sensor for metrics/logs; not part of the YAML
 	// config (populated by LoadTopicConfiguration)
-	Name string `yaml:"-"`
+	Name    string   `yaml:"-"`
+	Aliases []string `yaml:"-"`
 }
 
 type Sensor struct {
@@ -121,12 +123,15 @@ func LoadTopicConfiguration(configFilePath, deviceId string) (TopicConfiguration
 	}
 	for i := range topicConfig.Trigger {
 		topicConfig.Trigger[i].Topic = strings.ReplaceAll(topicConfig.Trigger[i].Topic, "__DEVICE_ID__", deviceId)
+		topicConfig.Trigger[i].RunTopic = strings.ReplaceAll(topicConfig.Trigger[i].RunTopic, "__DEVICE_ID__", deviceId)
 	}
 	for i := range topicConfig.Sensor {
 		topicConfig.Sensor[i].ResultTopic = strings.ReplaceAll(topicConfig.Sensor[i].ResultTopic, "__DEVICE_ID__", deviceId)
+		topicConfig.Sensor[i].QueryTopic = strings.ReplaceAll(topicConfig.Sensor[i].QueryTopic, "__DEVICE_ID__", deviceId)
 	}
 	for i := range topicConfig.MultiSensor {
 		topicConfig.MultiSensor[i].ResultTopic = strings.ReplaceAll(topicConfig.MultiSensor[i].ResultTopic, "__DEVICE_ID__", deviceId)
+		topicConfig.MultiSensor[i].QueryTopic = strings.ReplaceAll(topicConfig.MultiSensor[i].QueryTopic, "__DEVICE_ID__", deviceId)
 	}
 
 	//populate entity names for metrics/logs: single sensors use their own
@@ -137,9 +142,15 @@ func LoadTopicConfiguration(configFilePath, deviceId string) (TopicConfiguration
 	for i := range topicConfig.MultiSensor {
 		if len(topicConfig.MultiSensor[i].Values) > 0 {
 			topicConfig.MultiSensor[i].GeneralSensor.Name = topicConfig.MultiSensor[i].Values[0].Name
+			for _, value := range topicConfig.MultiSensor[i].Values[1:] {
+				topicConfig.MultiSensor[i].Aliases = append(topicConfig.MultiSensor[i].Aliases, value.Name)
+			}
 		}
 	}
 
+	if err := topicConfig.validateRequestTopics(); err != nil {
+		return TopicConfigurations{}, fmt.Errorf("invalid config: %w", err)
+	}
 	return topicConfig, nil
 }
 
@@ -205,19 +216,7 @@ func validateSensor(sensor Sensor) error {
 	if sensor.Name == "" {
 		return errors.New("name must not be empty")
 	}
-	if time.Duration(sensor.Interval).Nanoseconds() == 0 {
-		return errors.New("invalid duration")
-	}
-	if err := validateTimeout(sensor.Timeout); err != nil {
-		return err
-	}
-	if err := checkTopicName(sensor.ResultTopic); err != nil {
-		return fmt.Errorf("invalid topic: %w", err)
-	}
-	if sensor.Command.Name == "" {
-		return errors.New("command name must not be empty")
-	}
-	return nil
+	return validateGeneralSensor(sensor.GeneralSensor)
 }
 
 func validateMultiSensor(sensor MultiSensor) error {
@@ -232,14 +231,25 @@ func validateMultiSensor(sensor MultiSensor) error {
 			return errors.New("template must not be empty")
 		}
 	}
-	if time.Duration(sensor.Interval).Nanoseconds() == 0 {
-		return errors.New("invalid duration")
+	return validateGeneralSensor(sensor.GeneralSensor)
+}
+
+func validateGeneralSensor(sensor GeneralSensor) error {
+	if sensor.Interval < 0 {
+		return errors.New("interval must not be negative")
+	}
+	if sensor.QueryTopic != "" {
+		if err := checkTopicName(sensor.QueryTopic); err != nil {
+			return fmt.Errorf("invalid query_topic: %w", err)
+		}
 	}
 	if err := validateTimeout(sensor.Timeout); err != nil {
 		return err
 	}
-	if err := checkTopicName(sensor.ResultTopic); err != nil {
-		return fmt.Errorf("invalid topic: %w", err)
+	if sensor.ResultTopic != "" || sensor.Interval > 0 || sensor.QueryTopic != "" {
+		if err := checkTopicName(sensor.ResultTopic); err != nil {
+			return fmt.Errorf("invalid topic: %w", err)
+		}
 	}
 	if sensor.Command.Name == "" {
 		return errors.New("command name must not be empty")
@@ -254,11 +264,47 @@ func validateTrigger(trigger Trigger) error {
 	if err := checkTopicName(trigger.Topic); err != nil {
 		return fmt.Errorf("invalid topic: %w", err)
 	}
+	if trigger.RunTopic != "" {
+		if err := checkTopicName(trigger.RunTopic); err != nil {
+			return fmt.Errorf("invalid run_topic: %w", err)
+		}
+	}
 	if err := validateTimeout(trigger.Timeout); err != nil {
 		return err
 	}
 	if trigger.Command.Name == "" {
 		return errors.New("command name must not be empty")
+	}
+	return nil
+}
+
+// New request topics must be distinct from each other and from any existing
+// ingress or publication topic. A collision could make a publish run commands.
+func (t *TopicConfigurations) validateRequestTopics() error {
+	used := make(map[string]bool)
+	if t.Availability != nil {
+		used[t.Availability.Topic] = true
+	}
+	for _, trigger := range t.Trigger {
+		used[trigger.Topic] = true
+		used[trigger.Topic+"/STATE"] = true
+		used[trigger.Topic+"/RESULT"] = true
+	}
+	sensors := t.Sensors()
+	for _, sensor := range sensors {
+		used[sensor.ResultTopic] = true
+	}
+	for _, trigger := range t.Trigger {
+		if trigger.RunTopic != "" && used[trigger.RunTopic] {
+			return fmt.Errorf("run_topic %q is already used", trigger.RunTopic)
+		}
+		used[trigger.RunTopic] = true
+	}
+	for _, sensor := range sensors {
+		if sensor.QueryTopic != "" && used[sensor.QueryTopic] {
+			return fmt.Errorf("query_topic %q is already used", sensor.QueryTopic)
+		}
+		used[sensor.QueryTopic] = true
 	}
 	return nil
 }

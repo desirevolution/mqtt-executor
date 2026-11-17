@@ -1,6 +1,9 @@
 package transport
 
 import (
+	"errors"
+	"time"
+
 	MQTT "github.com/eclipse/paho.mqtt.golang"
 )
 
@@ -17,7 +20,12 @@ func NewMQTTPublisher(client MQTT.Client) Publisher {
 }
 
 func (p *MQTTPublisher) Publish(topic string, qos byte, retained bool, payload any) error {
+	if !p.client.IsConnectionOpen() {
+		return MQTT.ErrNotConnected
+	}
 	token := p.client.Publish(topic, qos, retained, payload)
-	token.Wait()
+	if !token.WaitTimeout(5 * time.Second) {
+		return errors.New("MQTT publish acknowledgement timed out")
+	}
 	return token.Error()
 }

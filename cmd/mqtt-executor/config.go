@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/denisbrodbeck/machineid"
 	MQTT "github.com/eclipse/paho.mqtt.golang"
@@ -54,7 +55,7 @@ func LoadConfig() {
 
 		HomeassistantEnable: flag.Bool("home-assistant", false, "Enable home assistant support (optional)"),
 		HomeassistantTopic:  flag.String("ha-discovery-prefix", "homeassistant/", "The mqtt topic prefix for homeassistant's discovery (optional)"),
-		WebAddress:          flag.String("web", ":8080", "The webhook server listen address (optional, empty disables the server)"),
+		WebAddress:          flag.String("web", "127.0.0.1:8080", "The webhook server listen address (optional, empty disables the server)"),
 		LogFormat:           flag.String("log-format", "text", "The log format: text or json (optional)"),
 		ShowVersion:         flag.Bool("version", false, "Print the version and exit"),
 		TopicConfigFile:     flag.String("config", "./config.yaml", "The topic configuration file"),
@@ -126,8 +127,10 @@ func validateBrokerRequirements(broker string, topicConfig internalConf.TopicCon
 	if broker != "" {
 		return nil
 	}
-	if len(topicConfig.Sensor) > 0 || len(topicConfig.MultiSensor) > 0 {
-		return errors.New("broker is missing! interval-driven sensors require an mqtt broker to publish to")
+	for _, sensor := range topicConfig.Sensors() {
+		if sensor.Interval > 0 {
+			return errors.New("broker is missing! interval-driven sensors require an mqtt broker to publish to")
+		}
 	}
 	return nil
 }
@@ -137,6 +140,7 @@ func (c *applicationConfig) GetMQTTOpts(
 	onLost MQTT.ConnectionLostHandler) *MQTT.ClientOptions {
 
 	opts := MQTT.NewClientOptions()
+	opts.SetWriteTimeout(5 * time.Second)
 
 	opts.AddBroker(*c.Broker)
 	if *c.Username != "" {

@@ -7,171 +7,213 @@ import (
 	"sync"
 	"time"
 
+	MQTT "github.com/eclipse/paho.mqtt.golang"
 	"github.com/rainu/mqtt-executor/internal/cmd"
 	"github.com/rainu/mqtt-executor/internal/metrics"
 	"github.com/rainu/mqtt-executor/internal/mqtt/config"
 	"github.com/rainu/mqtt-executor/internal/transport"
 )
 
-type SensorWorker struct {
-	waitGroup  sync.WaitGroup
-	cancelFunc context.CancelFunc
-	publishQOS byte
-
-	Executor  *cmd.CommandExecutor
-	Publisher transport.Publisher
-
-	// queryables maps an entity name to its sensor configuration for manual
-	// (webhook) queries. Single sensors register under their name, multi
-	// sensor values under their value name (sharing the same configuration).
-	// Swapped via SetQueryables (hot reload), read concurrently by ExecuteOnce.
-	queryablesMu sync.RWMutex
-	queryables   map[string]config.GeneralSensor
-}
-
 var ErrUnknownSensor = errors.New("unknown sensor")
 
-// SetQueryables swaps the queryable sensor configurations (hot reload). It
-// is safe to call while queries are served.
-func (s *SensorWorker) SetQueryables(queryables map[string]config.GeneralSensor) {
-	s.queryablesMu.Lock()
-	defer s.queryablesMu.Unlock()
-	s.queryables = queryables
+type SensorWorker struct {
+	mu      sync.RWMutex
+	session *sensorSession
+
+	Executor   *cmd.CommandExecutor
+	Publisher  transport.Publisher
+	MqttClient MQTT.Client
 }
 
-func (s *SensorWorker) lookupQueryable(name string) (config.GeneralSensor, bool) {
-	s.queryablesMu.RLock()
-	defer s.queryablesMu.RUnlock()
-	sensorConf, ok := s.queryables[name]
-	return sensorConf, ok
+type sensorSession struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	mu         sync.Mutex // coordinates admissions with shutdown and protects measurements
+	workers    sync.WaitGroup
+	publishQOS byte
+	queryables map[string]*configuredSensor
+	topics     map[string]*configuredSensor
 }
 
-func (s *SensorWorker) Initialise(publishQOS byte, sensorConfigs []config.GeneralSensor) {
-	s.queryablesMu.Lock()
-	s.publishQOS = publishQOS
-	s.queryablesMu.Unlock()
+type configuredSensor struct {
+	config        config.GeneralSensor
+	active        *measurement
+	lastPublished string
+	hasPublished  bool
+}
 
-	//generate a context so that we can cancel it later (see Close func)
-	var ctx context.Context
-	ctx, s.cancelFunc = context.WithCancel(context.Background())
+type measurement struct {
+	done   chan struct{}
+	manual bool
+	output []byte
+	err    error
+}
 
-	for _, sensorConf := range sensorConfigs {
-		s.waitGroup.Add(1)
-		go s.runSensor(ctx, sensorConf)
+func (s *SensorWorker) Initialise(publishQOS byte, configs []config.GeneralSensor) {
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &sensorSession{
+		ctx: ctx, cancel: cancel, publishQOS: publishQOS,
+		queryables: make(map[string]*configuredSensor),
+		topics:     make(map[string]*configuredSensor),
+	}
+	for _, conf := range configs {
+		sensor := &configuredSensor{config: conf}
+		session.queryables[conf.Name] = sensor
+		for _, alias := range conf.Aliases {
+			session.queryables[alias] = sensor
+		}
+		if conf.QueryTopic != "" {
+			session.topics[conf.QueryTopic] = sensor
+		}
+		if conf.Interval > 0 {
+			session.workers.Go(func() { s.runSensor(session, sensor) })
+		}
+	}
+
+	s.mu.Lock()
+	s.session = session
+	s.mu.Unlock()
+}
+
+func (s *SensorWorker) ReInitialise(subscribeQOS byte) {
+	session := s.currentSession()
+	if s.MqttClient == nil || session == nil {
+		return
+	}
+	for topic, sensor := range session.topics {
+		s.MqttClient.Subscribe(topic, subscribeQOS, func(_ MQTT.Client, message MQTT.Message) {
+			if !message.Retained() {
+				s.measure(session, sensor, true)
+			}
+		})
 	}
 }
 
-func (s *SensorWorker) runSensor(ctx context.Context, sensorConf config.GeneralSensor) {
-	defer s.waitGroup.Done()
+func (s *SensorWorker) currentSession() *sensorSession {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.session
+}
 
-	var lastPublished string
-	hasPublished := false
-
-	run := func() {
-		output, execErr := s.executeSensor(ctx, sensorConf)
-
-		//the comparison basis is the last PUBLISHED payload (success output
-		//or <FAILED> error): a recovery after an intermittent error differs
-		//from the failed payload and is published again
-		payload := output
-		if execErr != nil {
-			payload = []byte(PayloadResultFailedPrefix + execErr.Error())
-		}
-
-		//with publish_on_change: skip publishing when the payload did not
-		//change since the last run (manual webhook queries always publish,
-		//see ExecuteOnce). Without the option the state is not tracked at all.
-		if sensorConf.PublishOnChange && hasPublished && string(payload) == lastPublished {
-			return
-		}
-		if sensorConf.PublishOnChange {
-			lastPublished, hasPublished = string(payload), true
-		}
-
-		//errors are published just like regular results
-		s.publishResult(sensorConf.ResultTopic, s.publishQOS, sensorConf.Retained, payload)
-	}
-
-	//first execution
-	run()
-
-	ticker := time.NewTicker(time.Duration(sensorConf.Interval))
+func (s *SensorWorker) runSensor(session *sensorSession, sensor *configuredSensor) {
+	ticker := time.NewTicker(time.Duration(sensor.config.Interval))
 	defer ticker.Stop()
 	for {
-		//wait until next tick or shutdown
-		select {
-		case <-ticker.C:
-			run()
-		case <-ctx.Done():
+		run := s.measure(session, sensor, false)
+		if run == nil {
 			return
+		}
+		select {
+		case <-session.ctx.Done():
+			return
+		case <-run.done:
+		}
+		select {
+		case <-session.ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
 }
 
-// qos returns the current publish QoS (lock-guarded: interval goroutines and
-// webhook queries read it while a hot reload may swap it).
-func (s *SensorWorker) qos() byte {
-	s.queryablesMu.RLock()
-	defer s.queryablesMu.RUnlock()
-	return s.publishQOS
+// measure joins an active measurement or starts one shared by every ingress.
+// The lifetime belongs to the worker, so an HTTP disconnect only cancels
+// that caller's wait. Reload and shutdown cancel the measurement itself.
+func (s *SensorWorker) measure(session *sensorSession, sensor *configuredSensor, manual bool) *measurement {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	if session.ctx.Err() != nil {
+		return nil
+	}
+	if run := sensor.active; run != nil {
+		run.manual = run.manual || manual
+		return run
+	}
+	run := &measurement{done: make(chan struct{}), manual: manual}
+	sensor.active = run
+	session.workers.Go(func() { s.completeMeasurement(session, sensor, run) })
+	return run
 }
 
-// executeSensor runs the sensor's command (with the optional per-sensor
-// timeout applied to the given context) and returns the output without
-// publishing. Publishing is decided by the callers (interval runs respect
-// publish_on_change, manual queries always publish).
-func (s *SensorWorker) executeSensor(ctx context.Context, sensorConf config.GeneralSensor) ([]byte, error) {
-	if sensorConf.Timeout > 0 {
+func (s *SensorWorker) completeMeasurement(session *sensorSession, sensor *configuredSensor, run *measurement) {
+	conf := sensor.config
+	ctx := session.ctx
+	if conf.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(sensorConf.Timeout))
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(conf.Timeout))
 		defer cancel()
 	}
-
-	return metrics.Instrument(metrics.EntityTypeSensor, sensorConf.Name, func() ([]byte, error) {
-		return s.Executor.ExecuteCommandWithContext(sensorConf.Command.Name, sensorConf.Command.Arguments, ctx)
+	run.output, run.err = metrics.Instrument(metrics.EntityTypeSensor, conf.Name, func() ([]byte, error) {
+		return s.Executor.ExecuteCommandWithContext(conf.Command.Name, conf.Command.Arguments, ctx)
 	})
+	payload := run.output
+	if run.err != nil {
+		payload = []byte(PayloadResultFailedPrefix + run.err.Error())
+	}
+
+	session.mu.Lock()
+	publish := session.ctx.Err() == nil && conf.ResultTopic != "" &&
+		(run.manual || !conf.PublishOnChange || !sensor.hasPublished || string(payload) != sensor.lastPublished)
+	if publish {
+		// Keep the measurement joinable until its publication finishes.
+		session.mu.Unlock()
+		err := s.Publisher.Publish(conf.ResultTopic, session.publishQOS, conf.Retained, payload)
+		session.mu.Lock()
+		if err == nil {
+			sensor.lastPublished, sensor.hasPublished = string(payload), true
+		} else {
+			slog.Error("Failed to publish sensor result", "topic", conf.ResultTopic, "error", err)
+		}
+	}
+	sensor.active = nil
+	close(run.done)
+	session.mu.Unlock()
 }
 
-// ExecuteOnce runs the named sensor's command synchronously and always
-// publishes the result (an explicit query counts more than chatter
-// reduction). It returns the command output and the execution error, if any.
-// The given context cancels the command (e.g. when the HTTP request is
-// aborted or on shutdown).
 func (s *SensorWorker) ExecuteOnce(ctx context.Context, name string) ([]byte, error) {
-	sensorConf, ok := s.lookupQueryable(name)
-	if !ok {
+	session := s.currentSession()
+	if session == nil || session.queryables[name] == nil {
 		return nil, ErrUnknownSensor
 	}
-
-	output, execErr := s.executeSensor(ctx, sensorConf)
-	if execErr != nil {
-		s.publishResult(sensorConf.ResultTopic, s.publishQOS, sensorConf.Retained, PayloadResultFailedPrefix+execErr.Error())
-		return output, execErr
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-
-	s.publishResult(sensorConf.ResultTopic, s.publishQOS, sensorConf.Retained, output)
-	return output, nil
-}
-
-func (s *SensorWorker) publishResult(topic string, publishQOS byte, retained bool, payload any) {
-	if err := s.Publisher.Publish(topic, publishQOS, retained, payload); err != nil {
-		slog.Error("Failed to publish sensor result", "topic", topic, "error", err)
+	run := s.measure(session, session.queryables[name], true)
+	if run == nil {
+		return nil, context.Canceled
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-run.done:
+		return run.output, run.err
 	}
 }
 
 func (s *SensorWorker) Close(timeout time.Duration) error {
-	if s.cancelFunc != nil {
-		//close the context to interrupt possible running commands
-		s.cancelFunc()
+	s.mu.Lock()
+	session := s.session
+	s.session = nil
+	s.mu.Unlock()
+	if session == nil {
+		return nil
+	}
+
+	session.mu.Lock()
+	session.cancel()
+	session.mu.Unlock()
+	if s.MqttClient != nil {
+		for topic := range session.topics {
+			s.MqttClient.Unsubscribe(topic)
+		}
 	}
 
 	done := make(chan struct{})
 	go func() {
-		s.waitGroup.Wait()
+		session.workers.Wait()
 		close(done)
 	}()
-
-	//wait for WaitGroup or Timeout
 	select {
 	case <-done:
 		return nil

@@ -14,7 +14,6 @@ import (
 	MQTT "github.com/eclipse/paho.mqtt.golang"
 	"github.com/rainu/mqtt-executor/internal/cmd"
 	"github.com/rainu/mqtt-executor/internal/mqtt"
-	internalConf "github.com/rainu/mqtt-executor/internal/mqtt/config"
 	"github.com/rainu/mqtt-executor/internal/mqtt/hassio"
 	"github.com/rainu/mqtt-executor/internal/transport"
 	"github.com/rainu/mqtt-executor/internal/webhook"
@@ -26,21 +25,8 @@ var sensorWorker mqtt.SensorWorker
 var trigger mqtt.Trigger
 var webServer *webhook.Server
 
-// buildQueryables maps an entity name to its sensor configuration for manual
-// (webhook) queries: single sensors under their name, multi sensor values
-// under their value name (sharing the same configuration).
-func buildQueryables() map[string]internalConf.GeneralSensor {
-	queryables := map[string]internalConf.GeneralSensor{}
-	for _, sensor := range Config.TopicConfigurations.Sensor {
-		queryables[sensor.Name] = sensor.GeneralSensor
-	}
-	for _, multi := range Config.TopicConfigurations.MultiSensor {
-		for _, value := range multi.Values {
-			queryables[value.Name] = multi.GeneralSensor
-		}
-	}
-	return queryables
-}
+var workerLifecycle sync.Mutex
+var workersStopped bool
 
 // applyWorkerConfig (re-)starts the trigger and sensor workers with the
 // active configuration (Config.TopicConfigurations). It is used at startup
@@ -48,9 +34,7 @@ func buildQueryables() map[string]internalConf.GeneralSensor {
 func applyWorkerConfig() {
 	trigger.Initialise(byte(*Config.SubscribeQOS), byte(*Config.PublishQOS), Config.TopicConfigurations.Trigger)
 	sensorWorker.Initialise(byte(*Config.PublishQOS), Config.TopicConfigurations.Sensors())
-	//queryables last: manual webhook queries switch to the new configuration
-	//after the interval workers already run (micro-window either way)
-	sensorWorker.SetQueryables(buildQueryables())
+	sensorWorker.ReInitialise(byte(*Config.SubscribeQOS))
 }
 
 func main() {
@@ -76,6 +60,8 @@ func main() {
 			handleOnConnectionLost,
 		))
 		publisher = transport.NewMQTTPublisher(client)
+		trigger.MqttClient = client
+		sensorWorker.MqttClient = client
 
 		if token := client.Connect(); token.Wait() && token.Error() != nil {
 			fatal("Error while connecting to mqtt broker", "error", token.Error())
@@ -108,7 +94,9 @@ func main() {
 	}
 
 	//register trigger and sensors
+	workerLifecycle.Lock()
 	applyWorkerConfig()
+	workerLifecycle.Unlock()
 
 	//webhook server: synchronous HTTP ingress next to MQTT
 	webServer = webhook.NewServer(*Config.WebAddress, &trigger, &sensorWorker, startTime)
@@ -152,6 +140,9 @@ func handleReload(client MQTT.Client, publisher transport.Publisher) {
 		return
 	}
 
+	workerLifecycle.Lock()
+	defer workerLifecycle.Unlock()
+
 	//stop the trigger and sensor workers (running interval commands are
 	//cancelled; running trigger commands may finish). Note: if a Close hits
 	//its timeout, the worker's waiter goroutine lingers until the next Close
@@ -184,12 +175,15 @@ func handleReload(client MQTT.Client, publisher transport.Publisher) {
 }
 
 var handleOnConnection = func(client MQTT.Client) {
-	if !trigger.IsInitialised() {
+	workerLifecycle.Lock()
+	defer workerLifecycle.Unlock()
+	if workersStopped || !trigger.IsInitialised() {
 		return
 	}
 
 	slog.Info("Reinitialise...")
 	trigger.ReInitialise()
+	sensorWorker.ReInitialise(byte(*Config.SubscribeQOS))
 }
 
 var handleOnConnectionLost = func(client MQTT.Client, err error) {
@@ -198,6 +192,9 @@ var handleOnConnectionLost = func(client MQTT.Client, err error) {
 
 func shutdown(client MQTT.Client) {
 	slog.Info("Shutting down...")
+	workerLifecycle.Lock()
+	workersStopped = true
+	workerLifecycle.Unlock()
 
 	type closable interface {
 		Close(time.Duration) error

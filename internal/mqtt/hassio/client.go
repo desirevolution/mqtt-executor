@@ -81,6 +81,9 @@ func (c *Client) PublishDiscoveryConfig(config config.TopicConfigurations) error
 
 	//sensor
 	for _, sensor := range config.Sensor {
+		if sensor.ResultTopic == "" {
+			continue
+		}
 		targetTopic := fmt.Sprintf("%ssensor/%s_%s/config", c.TopicPrefix, c.DeviceId, friendlyName(sensor.Name))
 		payload, err := c.generatePayloadForSensor(config.Availability, sensor)
 		if err != nil {
@@ -93,6 +96,9 @@ func (c *Client) PublishDiscoveryConfig(config config.TopicConfigurations) error
 
 	//multi sensor
 	for _, sensor := range config.MultiSensor {
+		if sensor.ResultTopic == "" {
+			continue
+		}
 		for _, sensorValue := range sensor.Values {
 			targetTopic := fmt.Sprintf("%ssensor/%s_%s/config", c.TopicPrefix, c.DeviceId, friendlyName(sensorValue.Name))
 			payload, err := c.generatePayloadForMultiSensor(config.Availability, sensor, sensorValue)

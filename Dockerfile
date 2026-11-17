@@ -25,7 +25,8 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates
 WORKDIR /etc/mqtt-executor
 COPY --from=build /out/mqtt-executor /usr/local/bin/mqtt-executor
-#webhook server (default -web=:8080); the healthcheck probes GET /status.
+# The webhook defaults to loopback. Set -web 0.0.0.0:8080 for published ports.
+# The healthcheck probes GET /status from inside the container.
 #Disable it (docker: --no-healthcheck, compose: healthcheck.disable: true)
 #when running with -web="" or a non-default -web port
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -q --spider http://127.0.0.1:8080/status || exit 1

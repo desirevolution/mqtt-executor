@@ -104,24 +104,23 @@ func (f *fakePublisher) waitUntilStoppedCount(t *testing.T, stateTopic string, n
 }
 
 type fakeMqttMessage struct {
-	topic   string
-	payload []byte
+	topic    string
+	payload  []byte
+	retained bool
 }
 
 func (f fakeMqttMessage) Ack()              {}
 func (f fakeMqttMessage) Duplicate() bool   { return false }
 func (f fakeMqttMessage) Qos() byte         { return 0 }
-func (f fakeMqttMessage) Retained() bool    { return false }
+func (f fakeMqttMessage) Retained() bool    { return f.retained }
 func (f fakeMqttMessage) Topic() string     { return f.topic }
 func (f fakeMqttMessage) MessageID() uint16 { return 0 }
 func (f fakeMqttMessage) Payload() []byte   { return f.payload }
 
 func newTestTrigger(publisher transport.Publisher) *Trigger {
 	return &Trigger{
-		Executor:        cmd.NewCommandExecutor(),
-		Publisher:       publisher,
-		runningCommands: map[string]context.CancelFunc{},
-		subscriptions:   map[string]subscription{},
+		Executor:  cmd.NewCommandExecutor(),
+		Publisher: publisher,
 	}
 }
 
@@ -137,7 +136,9 @@ func TestTwoRapidStartsRunCommandOnce(t *testing.T) {
 		//first run is still active
 		Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "sleep 0.2; echo done"}},
 	}
-	handler := tr.createTriggerHandler(triggerConf)
+	triggerConf.Topic = "cmnd/test"
+	tr.triggersByName = map[string]config.Trigger{triggerConf.Name: triggerConf}
+	handler := tr.triggerHandler(triggerConf.Name, 0, false)
 
 	handler(nil, fakeMqttMessage{topic: "cmnd/test", payload: []byte(PayloadStart)})
 	handler(nil, fakeMqttMessage{topic: "cmnd/test", payload: []byte(PayloadStart)})
@@ -158,10 +159,13 @@ func TestStartAfterCompletionRunsAgain(t *testing.T) {
 		Name:    "test",
 		Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "echo quick"}},
 	}
-	handler := tr.createTriggerHandler(triggerConf)
+	triggerConf.Topic = "cmnd/test"
+	tr.triggersByName = map[string]config.Trigger{triggerConf.Name: triggerConf}
+	handler := tr.triggerHandler(triggerConf.Name, 0, false)
 
 	handler(nil, fakeMqttMessage{topic: "cmnd/test", payload: []byte(PayloadStart)})
 	pub.waitUntilStopped(t, "cmnd/test/STATE")
+	waitUntilTriggerIdle(t, tr, "test")
 
 	handler(nil, fakeMqttMessage{topic: "cmnd/test", payload: []byte(PayloadStart)})
 	pub.waitUntilStoppedCount(t, "cmnd/test/STATE", 2)
@@ -188,10 +192,17 @@ func TestInitialiseWithoutMqttClient(t *testing.T) {
 	assert.True(t, tr.IsInitialised())
 }
 
-// TestStopConcurrentWithCompletion stresses the stop path while commands may
-// complete at any moment: check+cancel+unregister must be atomic, otherwise a
-// nil cancel func in the map panics the goroutine (regression test for the
-// interruptCommand race found in review).
+func waitUntilTriggerIdle(t *testing.T, tr *Trigger, name string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		tr.lock.RLock()
+		defer tr.lock.RUnlock()
+		return tr.runningCommands[name] == nil
+	}, time.Second, time.Millisecond)
+}
+
+// TestStopConcurrentWithCompletion stresses repeated stop requests while a
+// run is completing, then verifies the trigger can reliably run again.
 func TestStopConcurrentWithCompletion(t *testing.T) {
 	pub := &fakePublisher{}
 	tr := newTestTrigger(pub)
@@ -199,15 +210,18 @@ func TestStopConcurrentWithCompletion(t *testing.T) {
 		Name:    "test",
 		Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "sleep 0.05; echo quick"}},
 	}
-	handler := tr.createTriggerHandler(triggerConf)
+	triggerConf.Topic = "cmnd/test"
+	tr.triggersByName = map[string]config.Trigger{triggerConf.Name: triggerConf}
+	handler := tr.triggerHandler(triggerConf.Name, 0, false)
 
 	for i := 0; i < 50; i++ {
 		handler(nil, fakeMqttMessage{topic: "cmnd/test", payload: []byte(PayloadStart)})
 		//hammer STOP while the command may finish at any moment
 		for j := 0; j < 5; j++ {
-			tr.stopTrigger(triggerConf)
+			tr.Stop(triggerConf.Name)
 		}
 		pub.waitUntilStoppedCount(t, "cmnd/test/STATE", i+1)
+		waitUntilTriggerIdle(t, tr, triggerConf.Name)
 	}
 }
 
@@ -296,7 +310,9 @@ func TestStopInterruptsRunningCommand(t *testing.T) {
 		Name:    "test",
 		Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "sleep 5; echo never"}},
 	}
-	handler := tr.createTriggerHandler(triggerConf)
+	triggerConf.Topic = "cmnd/test"
+	tr.triggersByName = map[string]config.Trigger{triggerConf.Name: triggerConf}
+	handler := tr.triggerHandler(triggerConf.Name, 0, false)
 
 	handler(nil, fakeMqttMessage{topic: "cmnd/test", payload: []byte(PayloadStart)})
 	require.Eventually(t, func() bool {
@@ -308,4 +324,68 @@ func TestStopInterruptsRunningCommand(t *testing.T) {
 
 	assert.Equal(t, 1, pub.count("cmnd/test/RESULT", "<INTERRUPTED>"), "INTERRUPTED result expected")
 	assert.Equal(t, 0, pub.countResult("cmnd/test/RESULT", "never"), "command output must not be published after interruption")
+}
+
+type blockedTriggerResult struct {
+	fakePublisher
+	once       sync.Once
+	publishing chan struct{}
+	finish     chan struct{}
+}
+
+func (p *blockedTriggerResult) Publish(topic string, qos byte, retained bool, payload any) error {
+	if result, ok := payload.(string); topic == "cmnd/test/RESULT" && ok && result == PayloadResultInterrupted {
+		p.once.Do(func() {
+			close(p.publishing)
+			<-p.finish
+		})
+	}
+	return p.fakePublisher.Publish(topic, qos, retained, payload)
+}
+
+func TestStopKeepsTriggerBusyUntilPreviousRunFinishes(t *testing.T) {
+	pub := &blockedTriggerResult{publishing: make(chan struct{}), finish: make(chan struct{})}
+	tr := newTestTrigger(pub)
+	tr.Initialise(1, 1, []config.Trigger{{
+		Name: "test", Topic: "cmnd/test", Command: config.Command{Name: "/bin/sleep", Arguments: []string{"30"}},
+	}})
+	t.Cleanup(func() { assert.NoError(t, tr.Executor.Close(time.Second)) })
+
+	require.NoError(t, tr.StartAsync("test", nil))
+	_, stopped := tr.Stop("test")
+	require.True(t, stopped)
+	select {
+	case <-pub.publishing:
+	case <-time.After(time.Second):
+		close(pub.finish)
+		t.Fatal("the interrupted run never began publishing its result")
+	}
+
+	assert.ErrorIs(t, tr.StartAsync("test", nil), ErrAlreadyRunning)
+	close(pub.finish)
+	require.Eventually(t, func() bool {
+		err := tr.StartAsync("test", nil)
+		return err == nil
+	}, time.Second, time.Millisecond)
+	_, stopped = tr.Stop("test")
+	require.True(t, stopped)
+	pub.waitUntilStoppedCount(t, "cmnd/test/STATE", 3)
+}
+
+func TestRunTopicUsesConfiguredFeedbackTopicAndIgnoresRetained(t *testing.T) {
+	pub := &fakePublisher{}
+	tr := newTestTrigger(pub)
+	tr.Initialise(1, 1, []config.Trigger{{
+		Name: "test", Topic: "cmnd/test", RunTopic: "cmnd/test/run", StdinPayload: true,
+		Command: config.Command{Name: "/bin/cat"},
+	}})
+
+	handle := tr.subscriptions["cmnd/test/run"]
+	handle(nil, fakeMqttMessage{topic: "cmnd/test/run", payload: []byte("replayed"), retained: true})
+	handle(nil, fakeMqttMessage{topic: "cmnd/test/run", payload: []byte("STOP")})
+
+	pub.waitUntilStoppedCount(t, "cmnd/test/STATE", 2)
+	assert.Equal(t, 1, pub.count("cmnd/test/RESULT", "STOP"))
+	assert.Equal(t, 0, pub.count("cmnd/test/RESULT", "replayed"))
+	assert.Equal(t, 0, pub.countTopic("cmnd/test/run/RESULT"))
 }

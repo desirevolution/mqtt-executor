@@ -28,11 +28,19 @@ go build -o mqtt-executor ./cmd/mqtt-executor/
 
 Or grab the release binaries from
 [releases](https://github.com/desirevolution/mqtt-executor/releases/latest) —
-built for linux+windows × 386/amd64/arm/arm64. The `linux-arm` binary targets
-**GOARM=6** explicitly, so it runs on armv6 *and* armv7 hardware (Raspberry Pi
-Zero/1, older OpenWrt devices). Container images (multi-arch:
-amd64/arm64/arm v7) live at `ghcr.io/desirevolution/mqtt-executor` (see
-[Docker](#docker)).
+with these Linux targets:
+
+| Binary | Target |
+| --- | --- |
+| `mqtt-executor-linux-amd64` | 64-bit x86 (Intel/AMD) |
+| `mqtt-executor-linux-arm64` | 64-bit ARM (AArch64) |
+| `mqtt-executor-linux-armv7` | 32-bit ARMv7 (`GOARM=7`) |
+| `mqtt-executor-linux-armv6` | 32-bit ARMv6 (`GOARM=6`), e.g. Raspberry Pi Zero/1 |
+
+Container images for `linux/amd64` and `linux/arm64` are available at
+`ghcr.io/desirevolution/mqtt-executor` (see [Docker](#docker)).
+Stable releases update the full version tag, the major.minor tag and `latest`.
+Pre-releases publish their full version tag.
 
 # Configuration
 
@@ -50,6 +58,7 @@ availability:
 trigger:
   - name: Touch file
     topic: cmnd/touch/file        # MQTT: send START / STOP here
+    run_topic: cmnd/touch/file/run # optional MQTT impulse with an optional payload
     timeout: 30s                  # optional, interrupt after 30s
     stdin_payload: true           # optional: message body / webhook body → stdin
     command:
@@ -59,6 +68,7 @@ trigger:
 sensor:
   - name: Free Memory
     topic: tele/__DEVICE_ID__/memory/free
+    query_topic: cmnd/__DEVICE_ID__/memory/query # optional MQTT request topic
     retained: false
     unit: kB                      # used for Home Assistant
     icon: hass:eye
@@ -95,6 +105,11 @@ Notes:
 - All configured commands must exist and be executable at startup
   (`exec.LookPath` / path check) — missing commands abort the start.
 - `interval` and `timeout` accept Go durations (`10s`, `1m30s`, …).
+- Omit `interval` for an on-demand sensor. A single HTTP-only sensor needs
+  only `name` and `command`. Periodic sensors and MQTT queries need a result
+  `topic`; periodic sensors also need a configured broker.
+- Choose distinct MQTT request topics. They must not match existing command,
+  availability, or result topics.
 
 # Usage
 
@@ -111,9 +126,9 @@ mqtt-executor -broker tcp://127.0.0.1:1883 -config /path/to/config.yaml -home-as
 
 | Flag | Default | Description |
 |---|---|---|
-| `-broker` | *(empty)* | Broker URI. **Optional** — empty means webhook-only mode. Sensors (interval-driven) require a broker; triggers work without one. |
+| `-broker` | *(empty)* | Broker URI. **Optional** — empty means webhook-only mode. Triggers and on-demand HTTP sensors work without a broker. Periodic sensors require a broker. |
 | `-config` | `./config.yaml` | Topic configuration file (YAML). |
-| `-web` | `:8080` | Webhook server listen address. Empty disables the server. |
+| `-web` | `127.0.0.1:8080` | Webhook listen address. Specify a LAN address for access from another machine. An empty value disables HTTP. |
 | `-sub-qos` / `-pub-qos` | `1` / `1` | MQTT QoS levels (0, 1, 2). |
 | `-user` / `-password` | *(empty)* | MQTT credentials. |
 | `-client-id` | `mqtt-executor` | MQTT client id. |
@@ -126,35 +141,39 @@ mqtt-executor -broker tcp://127.0.0.1:1883 -config /path/to/config.yaml -home-as
 
 # Webhook API
 
-The webhook server is synchronous: HTTP responses carry the result, MQTT side
-effects (STATE/RESULT, sensor publishes) still apply in broker mode. An
+The webhook API supports synchronous and asynchronous trigger starts.
+MQTT state and result publications also apply to HTTP calls in broker mode. An
 interactive playground is served at **`/docs`**, the machine-readable
 description at **`/openapi.yaml`** — both embedded, no external assets.
 
 ```bash
 # start a trigger and wait for the result
-curl -X POST http://localhost:8080/trigger/Touch\ file
+curl -X POST 'http://127.0.0.1:8080/trigger/Touch%20file'
 # → {"state":"STOPPED","result":"..."}
 
+# start asynchronously (HTTP 202)
+curl -i -X POST 'http://127.0.0.1:8080/trigger/Touch%20file/run'
+
 # pass a payload to the command (stdin_payload: true)
-curl -X POST http://localhost:8080/trigger/github -d '{"action":"push"}'
+curl -X POST http://127.0.0.1:8080/trigger/github -d '{"action":"push"}'
 
 # interrupt a running trigger (idempotent; alias: POST /trigger/<name>/stop)
-curl -X DELETE http://localhost:8080/trigger/Touch\ file
+curl -X DELETE 'http://127.0.0.1:8080/trigger/Touch%20file'
 
 # run a sensor command on demand (also published to MQTT, if broker)
-curl http://localhost:8080/sensor/Free\ Memory
+curl 'http://127.0.0.1:8080/sensor/Free%20Memory'
 
 # health + prometheus metrics
-curl http://localhost:8080/status
-curl http://localhost:8080/metrics
+curl http://127.0.0.1:8080/status
+curl http://127.0.0.1:8080/metrics
 ```
 
-Status codes: `200` finished/interrupted, `404` unknown name, `409` already
-running, `500` command failed (result starts with `<FAILED>;`). A configured
-timeout behaves like an intentional interrupt (`200`, `<INTERRUPTED>`); a
-sensor timeout is reported as failure (`500`, `<FAILED>;…`) — sensors have no
-interruption semantics.
+The synchronous start returns `200` when finished or interrupted.
+`POST /trigger/{name}/run` returns `202` when accepted and has no execution
+ID. Both start routes accept an optional raw body (up to 1 MiB) and report
+`404` for unknown triggers or `409` while an execution is active. A failing
+command returns `500` with `<FAILED>;` on synchronous calls. A trigger timeout
+returns `<INTERRUPTED>`; a sensor timeout is a measurement failure.
 
 # MQTT semantics (broker mode)
 
@@ -167,11 +186,28 @@ mosquitto_pub -t cmnd/example -m "START"
 mosquitto_pub -t cmnd/example -m "STOP"
 # read state and result
 mosquitto_sub -t "cmnd/example/STATE" -t "cmnd/example/RESULT"
+
+# once run_topic: cmnd/example/run is configured
+mosquitto_pub -t cmnd/example/run -n
+mosquitto_pub -t cmnd/example/run -m '{"value":42}'
+
+# once query_topic: cmnd/memory/query is configured
+mosquitto_pub -t cmnd/memory/query -n
 ```
 
 - `STATE`: `RUNNING` while the command runs, `STOPPED` otherwise
 - `RESULT`: command output, `<INTERRUPTED>` (stop/timeout) or `<FAILED>;<error>`
-- Only one run per trigger at a time; rapid `START`s don't race.
+- Trigger results use the configured command topic as their base, including
+  when a run was started via HTTP or `run_topic`.
+- With `stdin_payload: true`, HTTP and `run_topic` pass the raw input to
+  stdin. The existing command topic still passes the `START` message.
+- A trigger holds its execution slot until the current run completes,
+  including after a stop request. Further MQTT impulses are dropped.
+- Publish command, impulse, and query messages without retain. Replayed
+  retained requests are ignored when subscribing or reconnecting.
+- HTTP, MQTT and interval requests share an active sensor measurement.
+  Both manual routes publish its result if a broker and result topic are
+  configured, including when an unchanged result would otherwise be skipped.
 - With `-home-assistant`: switch + result/state entities are published via
   MQTT discovery; the webhook triggers the same entities. Note: entities of
   triggers/sensors removed via hot reload keep their retained discovery
@@ -199,6 +235,10 @@ docker run -d --name mqtt-executor \
   ghcr.io/desirevolution/mqtt-executor:latest \
   -config /config.yaml -device-id my-device -web 0.0.0.0:8080
 ```
+
+The example binds HTTP to all interfaces inside the container so the
+published port can reach it. Restrict the host-side port as needed, for
+example with `-p 127.0.0.1:8080:8080` for host-local access.
 
 The image (alpine-based, ~18 MB) ships a `HEALTHCHECK` probing
 `GET /status` (disable it with `--no-healthcheck` together with `-web ""` or

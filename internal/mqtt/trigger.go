@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -23,124 +22,81 @@ var (
 	ErrAlreadyRunning = errors.New("command already running")
 )
 
+type triggerRun struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
 type Trigger struct {
-	initialised     bool
 	lock            sync.RWMutex
-	runningCommands map[string]context.CancelFunc
-	triggerConfigs  []config.Trigger
+	statusMu        sync.Mutex // orders status snapshots with execution completion
+	generation      uint64
+	runningCommands map[string]*triggerRun
 	triggersByName  map[string]config.Trigger
-	subscriptions   map[string]subscription
+	subscriptions   map[string]MQTT.MessageHandler
 	subscribeQOS    byte
 	publishQOS      byte
 
-	Executor  *cmd.CommandExecutor
-	Publisher transport.Publisher
-	// MqttClient is only needed for the MQTT ingress (Subscribe/Unsubscribe).
-	// It is nil in webhook-only mode; all publishes run through the Publisher.
+	Executor   *cmd.CommandExecutor
+	Publisher  transport.Publisher
 	MqttClient MQTT.Client
 }
 
-type subscription struct {
-	trigger config.Trigger
-	handler MQTT.MessageHandler
-}
-
-// Initialise (re-)applies the given trigger configuration. It is safe to
-// call while the webhook server serves requests (hot reload): the lookups
-// maps are swapped atomically under the lock, MQTT subscriptions and the
-// initial state publishes happen outside the lock.
-func (t *Trigger) Initialise(subscribeQOS, publishQOS byte, triggerConfigs []config.Trigger) {
-	subscriptions := map[string]subscription{}
-	triggersByName := map[string]config.Trigger{}
-	for _, triggerConf := range triggerConfigs {
-		triggersByName[triggerConf.Name] = triggerConf
-		subscriptions[triggerConf.Name] = subscription{
-			trigger: triggerConf,
-			handler: t.createTriggerHandler(triggerConf),
-		}
-	}
-
+// Initialise applies the configuration. Existing runs own their name until
+// completion, including across a reload.
+func (t *Trigger) Initialise(subscribeQOS, publishQOS byte, configs []config.Trigger) {
 	t.lock.Lock()
+	t.generation++
 	t.subscribeQOS = subscribeQOS
 	t.publishQOS = publishQOS
-	t.triggerConfigs = triggerConfigs //safe the configs so that we can unsubscribe later (see Close func)
-	t.subscriptions = subscriptions
-	t.triggersByName = triggersByName
-	t.runningCommands = map[string]context.CancelFunc{}
-	t.initialised = true
-	t.lock.Unlock()
-
-	//MqttClient is nil in webhook-only mode: there is no MQTT ingress to
-	//subscribe to, but the trigger state machine stays fully usable
-	if t.MqttClient != nil {
-		for _, sub := range subscriptions {
-			t.MqttClient.Subscribe(sub.trigger.Topic, subscribeQOS, sub.handler)
+	t.subscriptions = make(map[string]MQTT.MessageHandler)
+	t.triggersByName = make(map[string]config.Trigger, len(configs))
+	for _, conf := range configs {
+		t.triggersByName[conf.Name] = conf
+		t.subscriptions[conf.Topic] = t.triggerHandler(conf.Name, t.generation, false)
+		if conf.RunTopic != "" {
+			t.subscriptions[conf.RunTopic] = t.triggerHandler(conf.Name, t.generation, true)
 		}
 	}
+	t.lock.Unlock()
 
-	//publish the stopped state on startup
-	for _, triggerConf := range triggerConfigs {
-		t.publishStatus(triggerConf.Topic, PayloadStatusStopped)
+	t.ReInitialise()
+}
+
+// ReInitialise restores subscriptions and reports the current state on reconnect.
+func (t *Trigger) ReInitialise() {
+	t.statusMu.Lock()
+	defer t.statusMu.Unlock()
+
+	t.lock.RLock()
+	subscriptions := t.subscriptions
+	subQOS, pubQOS := t.subscribeQOS, t.publishQOS
+	states := make(map[string]string, len(t.triggersByName))
+	for name, conf := range t.triggersByName {
+		state := PayloadStatusStopped
+		if t.runningCommands[name] != nil {
+			state = PayloadStatusRunning
+		}
+		states[conf.Topic] = state
+	}
+	t.lock.RUnlock()
+
+	for topic, state := range states {
+		t.publish(topic+"/"+TopicSuffixState, pubQOS, state)
+	}
+	if t.MqttClient != nil {
+		for topic, handler := range subscriptions {
+			t.MqttClient.Subscribe(topic, subQOS, handler)
+		}
 	}
 }
 
 func (t *Trigger) IsInitialised() bool {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
-	return t.initialised
+	return t.triggersByName != nil
 }
 
-// ReInitialise re-subscribes the MQTT ingress after a reconnect and republishes
-// the current state. It is not used by the hot reload (that path calls
-// Initialise with a new configuration).
-func (t *Trigger) ReInitialise() {
-	t.lock.RLock()
-	subscriptions := make(map[string]subscription, len(t.subscriptions))
-	for name, sub := range t.subscriptions {
-		subscriptions[name] = sub
-	}
-	subscribeQOS := t.subscribeQOS
-	t.lock.RUnlock()
-
-	for triggerName, subscription := range subscriptions {
-		if t.MqttClient != nil {
-			t.MqttClient.Subscribe(subscription.trigger.Topic, subscribeQOS, subscription.handler)
-		}
-
-		//publish the current state on reinitialisation
-		if t.isCommandRunning(triggerName) {
-			t.publishStatus(subscription.trigger.Topic, PayloadStatusRunning)
-		} else {
-			t.publishStatus(subscription.trigger.Topic, PayloadStatusStopped)
-		}
-	}
-}
-
-// StartSync executes the named trigger's command and waits for its
-// completion. The payload is passed to the command as stdin if the trigger is
-// configured with stdin_payload. It returns the final state, the result
-// payload (also published to MQTT when a broker is present) and the
-// execution error, if any (context.Canceled for an intentional interruption).
-func (t *Trigger) StartSync(name string, payload []byte) (state string, result string, err error) {
-	triggerConf, ok := t.lookup(name)
-	if !ok {
-		return "", "", ErrUnknownTrigger
-	}
-
-	ctx, registered := t.tryRegisterCommand(triggerConf)
-	if !registered {
-		return PayloadStatusRunning, "", ErrAlreadyRunning
-	}
-
-	var stdin io.Reader
-	if triggerConf.StdinPayload {
-		stdin = bytes.NewReader(payload)
-	}
-
-	return t.executeCommand(triggerConf.Topic, triggerConf, ctx, stdin)
-}
-
-// Exists reports whether a trigger with the given name is configured.
 func (t *Trigger) Exists(name string) bool {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
@@ -148,199 +104,178 @@ func (t *Trigger) Exists(name string) bool {
 	return ok
 }
 
-// Stop interrupts a running command of the named trigger. It reports whether
-// the trigger exists and whether a running command was stopped.
-func (t *Trigger) Stop(name string) (exists bool, stopped bool) {
-	triggerConf, ok := t.lookup(name)
-	if !ok {
-		return false, false
+func (t *Trigger) StartSync(name string, payload []byte) (state, result string, err error) {
+	conf, run, err := t.start(name, 0)
+	if errors.Is(err, ErrAlreadyRunning) {
+		return PayloadStatusRunning, "", err
 	}
-	return true, t.stopTrigger(triggerConf)
+	if err != nil {
+		return "", "", err
+	}
+	result, err = t.execute(conf, run, payload)
+	return PayloadStatusStopped, result, err
 }
 
-// lookup returns the trigger configuration with the given name.
-func (t *Trigger) lookup(name string) (config.Trigger, bool) {
-	t.lock.RLock()
-	defer t.lock.RUnlock()
-	triggerConf, ok := t.triggersByName[name]
-	return triggerConf, ok
+func (t *Trigger) StartAsync(name string, payload []byte) error {
+	return t.startAsync(name, payload, 0)
 }
 
-// stopTrigger interrupts and unregisters a running command of the given
-// trigger configuration. Check, cancel and unregister are atomic under one
-// write lock: otherwise the command could complete (and unregister itself)
-// between a separate check and the interrupt, leaving a nil cancel func in
-// the map.
-func (t *Trigger) stopTrigger(trigger config.Trigger) bool {
+func (t *Trigger) startAsync(name string, payload []byte, generation uint64) error {
+	conf, run, err := t.start(name, generation)
+	if err != nil {
+		return err
+	}
+	if conf.StdinPayload {
+		payload = bytes.Clone(payload)
+	}
+	go t.execute(conf, run, payload)
+	return nil
+}
+
+func (t *Trigger) start(name string, generation uint64) (config.Trigger, *triggerRun, error) {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	cancelFunc, exists := t.runningCommands[trigger.Name]
-	if !exists {
-		return false
+	conf, ok := t.triggersByName[name]
+	if !ok || (generation != 0 && generation != t.generation) {
+		return config.Trigger{}, nil, ErrUnknownTrigger
 	}
-
-	cancelFunc()
-	delete(t.runningCommands, trigger.Name)
-	return true
+	if t.runningCommands[name] != nil {
+		return config.Trigger{}, nil, ErrAlreadyRunning
+	}
+	if t.runningCommands == nil {
+		t.runningCommands = make(map[string]*triggerRun)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	run := &triggerRun{ctx: ctx, cancel: cancel}
+	t.runningCommands[name] = run
+	return conf, run, nil
 }
 
-func (t *Trigger) createTriggerHandler(triggerConfig config.Trigger) MQTT.MessageHandler {
-	return func(client MQTT.Client, message MQTT.Message) {
-		//payloads can contain sensitive data (see stdin_payload) - debug level only
-		slog.Debug("Incoming message",
-			"topic", message.Topic(),
-			"payload", string(message.Payload()),
-		)
+func (t *Trigger) Stop(name string) (exists, stopped bool) {
+	return t.stop(name, 0)
+}
 
-		action := strings.ToUpper(string(message.Payload()))
+func (t *Trigger) stop(name string, generation uint64) (exists, stopped bool) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 
-		switch action {
-		case PayloadStart:
-			//ensure that only one trigger runs at the same time (check and
-			//registration are atomic, see tryRegisterCommand)
-			ctx, ok := t.tryRegisterCommand(triggerConfig)
-			if !ok {
-				slog.Warn("Command is already running. Skip execution!", "trigger", triggerConfig.Name)
+	if _, ok := t.triggersByName[name]; !ok || (generation != 0 && generation != t.generation) {
+		return false, false
+	}
+	run := t.runningCommands[name]
+	if run == nil || run.ctx.Err() != nil {
+		return true, false
+	}
+	// The slot stays reserved until the process and its final publications
+	// finish. STOP cannot make a replacement overlap with the old run.
+	run.cancel()
+	return true, true
+}
+
+func (t *Trigger) triggerHandler(name string, generation uint64, impulse bool) MQTT.MessageHandler {
+	return func(_ MQTT.Client, message MQTT.Message) {
+		if message.Retained() {
+			return
+		}
+		if !impulse {
+			switch strings.ToUpper(string(message.Payload())) {
+			case PayloadStop:
+				t.stop(name, generation)
+				return
+			case PayloadStart:
+			default:
+				slog.Warn("Invalid MQTT trigger payload", "topic", message.Topic())
 				return
 			}
-
-			var stdin io.Reader
-			if triggerConfig.StdinPayload {
-				stdin = bytes.NewReader(message.Payload())
-			}
-			go func() {
-				//async fire-and-forget: the result is published to MQTT, the
-				//return values are only relevant for the synchronous (webhook) path
-				_, _, _ = t.executeCommand(message.Topic(), triggerConfig, ctx, stdin)
-			}()
-		case PayloadStop:
-			t.stopTrigger(triggerConfig)
-		default:
-			slog.Warn("Invalid payload. Do nothing.")
+		}
+		if err := t.startAsync(name, message.Payload(), generation); errors.Is(err, ErrAlreadyRunning) {
+			slog.Warn("Command is already running. Skip execution!", "trigger", name)
 		}
 	}
 }
 
-func (t *Trigger) isCommandRunning(triggerName string) bool {
-	//we only need read access
-	t.lock.RLock()
-	defer t.lock.RUnlock()
+func (t *Trigger) execute(conf config.Trigger, run *triggerRun, payload []byte) (string, error) {
+	defer t.finish(conf, run)
 
-	_, exist := t.runningCommands[triggerName]
-	return exist
-}
-
-// tryRegisterCommand atomically checks whether a command for the given trigger
-// is already running and, if not, registers it. This closes the gap between
-// the former separate check (RLock) and registration (Lock) that allowed two
-// rapid START messages to run the command concurrently.
-func (t *Trigger) tryRegisterCommand(trigger config.Trigger) (context.Context, bool) {
-	//we need write access
-	t.lock.Lock()
-	defer t.lock.Unlock()
-
-	if _, exists := t.runningCommands[trigger.Name]; exists {
-		return nil, false
-	}
-
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	t.runningCommands[trigger.Name] = cancelFunc
-
-	return ctx, true
-}
-
-func (t *Trigger) unregisterCommand(trigger config.Trigger) {
-	//we need write access
-	t.lock.Lock()
-	defer t.lock.Unlock()
-
-	//defensive: the command may already have been unregistered (e.g. by an
-	//incoming STOP message) - do not call a nil cancel func
-	if cancelFunc, exists := t.runningCommands[trigger.Name]; exists {
-		//call the cancel func to release the resources
-		cancelFunc()
-		delete(t.runningCommands, trigger.Name)
-	}
-}
-
-func (t *Trigger) executeCommand(topic string, trigger config.Trigger, ctx context.Context, stdin io.Reader) (state string, result string, execErr error) {
-	defer t.unregisterCommand(trigger) //unregister at end (registration happened in tryRegisterCommand)
-
-	//optional per-trigger timeout: the executor stays generic, the caller
-	//applies the timeout to the execution context
-	if trigger.Timeout > 0 {
+	ctx := run.ctx
+	if conf.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(trigger.Timeout))
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(conf.Timeout))
 		defer cancel()
 	}
+	var stdin io.Reader
+	if conf.StdinPayload {
+		stdin = bytes.NewReader(payload)
+	}
 
-	t.publishStatus(topic, PayloadStatusRunning)       //publish that we are now running
-	defer t.publishStatus(topic, PayloadStatusStopped) //at the end we are stopped
+	t.statusMu.Lock()
+	t.publish(conf.Topic+"/"+TopicSuffixState, t.qos(), PayloadStatusRunning)
+	t.statusMu.Unlock()
 
-	output, execErr := metrics.Instrument(metrics.EntityTypeTrigger, trigger.Name, func() ([]byte, error) {
-		return t.Executor.ExecuteCommandWithStdin(trigger.Command.Name, trigger.Command.Arguments, ctx, stdin)
+	output, err := metrics.Instrument(metrics.EntityTypeTrigger, conf.Name, func() ([]byte, error) {
+		return t.Executor.ExecuteCommandWithStdin(conf.Command.Name, conf.Command.Arguments, ctx, stdin)
 	})
+	topic := conf.Topic + "/" + TopicSuffixResult
 	switch {
-	case execErr == nil:
-		//publish the program's output (stdout & stderr)
-		t.publishResult(topic, output)
-		return PayloadStatusStopped, string(output), nil
-	case errors.Is(execErr, context.Canceled), errors.Is(execErr, context.DeadlineExceeded):
-		//this can happen if a STOPPED-Message was incoming, the timeout hit or
-		//the application is shutting down
-		t.publishResult(topic, PayloadResultInterrupted)
-		return PayloadStatusStopped, PayloadResultInterrupted, execErr
+	case err == nil:
+		t.publish(topic, t.qos(), output)
+		return string(output), nil
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		t.publish(topic, t.qos(), PayloadResultInterrupted)
+		return PayloadResultInterrupted, err
 	default:
-		//program execution failed (status code != 0)
-		t.publishResult(topic, PayloadResultFailedPrefix+execErr.Error())
-		return PayloadStatusStopped, PayloadResultFailedPrefix + execErr.Error(), execErr
+		result := PayloadResultFailedPrefix + err.Error()
+		t.publish(topic, t.qos(), result)
+		return result, err
 	}
 }
 
-func (t *Trigger) publishStatus(parentTopic, status string) {
-	stateTopic := t.buildStateTopic(parentTopic)
-	if err := t.Publisher.Publish(stateTopic, t.qos(), false, status); err != nil {
-		slog.Error("Failed to publish trigger state", "topic", stateTopic, "error", err)
+func (t *Trigger) finish(conf config.Trigger, run *triggerRun) {
+	defer run.cancel()
+	t.statusMu.Lock()
+	defer t.statusMu.Unlock()
+
+	t.lock.RLock()
+	current, configured := t.triggersByName[conf.Name]
+	qos := t.publishQOS
+	t.lock.RUnlock()
+
+	t.publish(conf.Topic+"/"+TopicSuffixState, qos, PayloadStatusStopped)
+	if configured && current.Topic != conf.Topic {
+		t.publish(current.Topic+"/"+TopicSuffixState, qos, PayloadStatusStopped)
+	}
+
+	t.lock.Lock()
+	if t.runningCommands[conf.Name] == run {
+		delete(t.runningCommands, conf.Name)
+	}
+	t.lock.Unlock()
+}
+
+func (t *Trigger) publish(topic string, qos byte, payload any) {
+	if err := t.Publisher.Publish(topic, qos, false, payload); err != nil {
+		slog.Error("Failed to publish trigger update", "topic", topic, "error", err)
 	}
 }
 
-func (t *Trigger) publishResult(parentTopic string, result any) {
-	resultTopic := t.buildResultTopic(parentTopic)
-	if err := t.Publisher.Publish(resultTopic, t.qos(), false, result); err != nil {
-		slog.Error("Failed to publish trigger result", "topic", resultTopic, "error", err)
-	}
-}
-
-// qos returns the current publish QoS (lock-guarded: running command
-// goroutines read it while a hot reload may swap it).
 func (t *Trigger) qos() byte {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 	return t.publishQOS
 }
 
-func (t *Trigger) buildStateTopic(parentTopic string) string {
-	return fmt.Sprintf("%s/%s", parentTopic, TopicSuffixState)
-}
+func (t *Trigger) Close(_ time.Duration) error {
+	t.lock.Lock()
+	subscriptions := t.subscriptions
+	t.subscriptions = nil
+	t.generation++
+	t.lock.Unlock()
 
-func (t *Trigger) buildResultTopic(parentTopic string) string {
-	return fmt.Sprintf("%s/%s", parentTopic, TopicSuffixResult)
-}
-
-func (t *Trigger) Close(timeout time.Duration) error {
-	//copy the configs under the lock, then unsubscribe outside of it
-	t.lock.RLock()
-	triggerConfigs := make([]config.Trigger, len(t.triggerConfigs))
-	copy(triggerConfigs, t.triggerConfigs)
-	t.lock.RUnlock()
-
-	//unsubscribe to all mqtt-topics (ignore the timeout!)
 	if t.MqttClient != nil {
-		for _, triggerConf := range triggerConfigs {
-			t.MqttClient.Unsubscribe(triggerConf.Topic)
+		for topic := range subscriptions {
+			t.MqttClient.Unsubscribe(topic)
 		}
 	}
-
 	return nil
 }

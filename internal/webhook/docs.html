@@ -19,7 +19,7 @@
 </head>
 <body>
 <h1>mqtt-executor — API playground</h1>
-<p>Synchronous HTTP ingress next to MQTT. <a href="/openapi.yaml">OpenAPI spec</a>.
+<p>HTTP ingress next to MQTT. <a href="/openapi.yaml">OpenAPI spec</a>.
 MQTT side effects (STATE/RESULT, sensor publishes) apply when a broker is configured.</p>
 
 <h2><span class="method post">POST</span> /trigger/{name}</h2>
@@ -28,7 +28,9 @@ command as stdin when the trigger is configured with <code>stdin_payload: true</
 <fieldset>
   <input type="text" id="trigger-name" placeholder="trigger name">
   <textarea id="trigger-body" placeholder="payload (optional; → stdin if configured)"></textarea>
-  <button onclick="startTrigger()">Start</button>
+  <button onclick="startTrigger(false)">Start and wait</button>
+  <button onclick="startTrigger(true)">Start in background</button>
+  <p>The background button calls <code>POST /trigger/{name}/run</code> and returns when accepted.</p>
   <pre id="trigger-out" hidden></pre>
 </fieldset>
 
@@ -41,7 +43,7 @@ command as stdin when the trigger is configured with <code>stdin_payload: true</
 </fieldset>
 
 <h2><span class="method get">GET</span> /sensor/{name}</h2>
-<p>Runs the sensor's command on demand and returns the output.</p>
+<p>Starts or joins a measurement and returns the output.</p>
 <fieldset>
   <input type="text" id="sensor-name" placeholder="sensor name">
   <button onclick="querySensor()">Query</button>
@@ -67,7 +69,7 @@ async function call(method, path, body, outId) {
     out.textContent = 'request failed: ' + err;
   }
 }
-const startTrigger = () => call('POST', '/trigger/' + encodeURIComponent(document.getElementById('trigger-name').value), document.getElementById('trigger-body').value, 'trigger-out');
+const startTrigger = (background) => call('POST', '/trigger/' + encodeURIComponent(document.getElementById('trigger-name').value) + (background ? '/run' : ''), document.getElementById('trigger-body').value, 'trigger-out');
 const stopTrigger = () => call('DELETE', '/trigger/' + encodeURIComponent(document.getElementById('stop-name').value), null, 'stop-out');
 const querySensor = () => call('GET', '/sensor/' + encodeURIComponent(document.getElementById('sensor-name').value), null, 'sensor-out');
 const get = (path, outId) => call('GET', path, null, outId);

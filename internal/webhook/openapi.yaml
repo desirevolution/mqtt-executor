@@ -2,10 +2,10 @@ openapi: 3.0.3
 info:
   title: mqtt-executor webhook API
   description: |
-    Synchronous HTTP ingress next to MQTT: start/interrupt trigger commands
-    and query sensor commands on demand. Results are returned in the HTTP
-    response; MQTT side effects (STATE, RESULT, sensor publishes) stay shared
-    with the MQTT ingress when a broker is configured.
+    HTTP ingress next to MQTT: start/interrupt trigger commands
+    and query sensor commands on demand. Synchronous calls return the result.
+    Asynchronous trigger starts return 202 on acceptance. A configured MQTT
+    connection receives the same state and result publications.
 
     Note: a trigger timeout (config `timeout`) and an intentional stop both
     return HTTP 200 with result `<INTERRUPTED>`. A command that exits
@@ -88,6 +88,39 @@ paths:
             text/plain:
               schema:
                 type: string
+  /trigger/{name}/run:
+    post:
+      summary: Start a trigger asynchronously
+      description: |
+        Accepts an optional raw body, passed to stdin when enabled. The response
+        confirms acceptance. A running trigger rejects additional starts.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        description: Optional payload, limited to 1 MiB.
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '202':
+          description: Execution accepted
+        '400':
+          description: Request body too large or unreadable
+        '404':
+          description: Unknown trigger
+        '409':
+          description: Trigger already running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TriggerResponse'
   /trigger/{name}/stop:
     post:
       summary: Alias for DELETE /trigger/{name}
@@ -112,11 +145,11 @@ paths:
                 type: string
   /sensor/{name}:
     get:
-      summary: Run a sensor command on demand
+      summary: Measure a sensor on demand
       description: |
-        Executes the sensor's command synchronously and returns the output.
-        The result is also published to MQTT (when a broker is configured),
-        independently of any `publish_on_change` setting.
+        Starts or joins an active measurement and returns its output. A
+        configured MQTT result topic receives the output even when a
+        publish_on_change check would otherwise skip it.
       parameters:
         - name: name
           in: path

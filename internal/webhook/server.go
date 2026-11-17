@@ -57,6 +57,7 @@ func NewServer(addr string, trigger *mqtt.Trigger, sensor *mqtt.SensorWorker, st
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /trigger/{name}", s.handleTriggerStart)
+	mux.HandleFunc("POST /trigger/{name}/run", s.handleTriggerRun)
 	mux.HandleFunc("DELETE /trigger/{name}", s.handleTriggerStop)
 	mux.HandleFunc("POST /trigger/{name}/stop", s.handleTriggerStop) //alias for DELETE
 	mux.HandleFunc("GET /sensor/{name}", s.handleSensor)
@@ -82,23 +83,15 @@ func NewServer(addr string, trigger *mqtt.Trigger, sensor *mqtt.SensorWorker, st
 // completion. The request body is the payload (passed to the command as stdin
 // if configured with stdin_payload).
 func (s *Server) handleTriggerStart(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-
-	//existence check before reading the body: reject unknown triggers
-	//without consuming the (up to 1 MiB) payload
-	if !s.Trigger.Exists(name) {
-		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown trigger %q", name))
-		return
-	}
-
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodySize))
-	if err != nil {
-		httpError(w, http.StatusBadRequest, fmt.Sprintf("could not read request body: %v", err))
+	name, body, ok := s.readTriggerRequest(w, r)
+	if !ok {
 		return
 	}
 
 	state, result, err := s.Trigger.StartSync(name, body)
 	switch {
+	case errors.Is(err, mqtt.ErrUnknownTrigger):
+		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown trigger %q", name))
 	case errors.Is(err, mqtt.ErrAlreadyRunning):
 		writeJSON(w, http.StatusConflict, triggerResponse{State: mqtt.PayloadStatusRunning})
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
@@ -111,6 +104,42 @@ func (s *Server) handleTriggerStart(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusOK, triggerResponse{State: state, Result: result})
 	}
+}
+
+func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
+	name, body, ok := s.readTriggerRequest(w, r)
+	if !ok {
+		return
+	}
+	switch err := s.Trigger.StartAsync(name, body); {
+	case errors.Is(err, mqtt.ErrUnknownTrigger):
+		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown trigger %q", name))
+	case errors.Is(err, mqtt.ErrAlreadyRunning):
+		writeJSON(w, http.StatusConflict, triggerResponse{State: mqtt.PayloadStatusRunning})
+	case err != nil:
+		httpError(w, http.StatusInternalServerError, err.Error())
+	default:
+		w.WriteHeader(http.StatusAccepted)
+	}
+}
+
+func (s *Server) readTriggerRequest(w http.ResponseWriter, r *http.Request) (string, []byte, bool) {
+	name := r.PathValue("name")
+
+	//existence check before reading the body: reject unknown triggers
+	//without consuming the (up to 1 MiB) payload
+	if !s.Trigger.Exists(name) {
+		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown trigger %q", name))
+		return "", nil, false
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodySize))
+	if err != nil {
+		httpError(w, http.StatusBadRequest, fmt.Sprintf("could not read request body: %v", err))
+		return "", nil, false
+	}
+
+	return name, body, true
 }
 
 // handleTriggerStop interrupts a running command. It is idempotent: stopping

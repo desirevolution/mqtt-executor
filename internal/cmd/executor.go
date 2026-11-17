@@ -12,14 +12,14 @@ import (
 )
 
 type CommandExecutor struct {
-	lock           sync.RWMutex
+	lock           sync.Mutex
+	closed         bool
 	usedContext    map[context.Context]context.CancelFunc
 	openExecutions sync.WaitGroup
 }
 
 func NewCommandExecutor() *CommandExecutor {
 	return &CommandExecutor{
-		lock:        sync.RWMutex{},
 		usedContext: map[context.Context]context.CancelFunc{},
 	}
 }
@@ -37,7 +37,9 @@ func (c *CommandExecutor) ExecuteCommandWithContext(cmd string, args []string, e
 func (c *CommandExecutor) ExecuteCommandWithStdin(cmd string, args []string, executionContext context.Context, stdin io.Reader) ([]byte, error) {
 	//register the context so that we have a chance to cancel the commands later
 	ctx := c.registerContext(executionContext)
-	c.openExecutions.Add(1)
+	if ctx == nil {
+		return nil, context.Canceled
+	}
 	defer c.openExecutions.Done()
 	defer c.releaseContext(ctx)
 
@@ -71,6 +73,11 @@ func (c *CommandExecutor) registerContext(parentContext context.Context) context
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
+	if c.closed {
+		return nil
+	}
+	c.openExecutions.Add(1)
+
 	//wrap the given context so that we can later cancel the context (see Close func)
 	ctx, cancelFunc := context.WithCancel(parentContext)
 	c.usedContext[ctx] = cancelFunc
@@ -90,34 +97,19 @@ func (c *CommandExecutor) releaseContext(ctx context.Context) {
 }
 
 func (c *CommandExecutor) Close(timeout time.Duration) error {
-	wg := sync.WaitGroup{}
-
-	//this lock ensures that no new commands can start
 	c.lock.Lock()
-	defer c.lock.Unlock()
-
-	//cancel all in parallel
-	for ctx, cancelFunc := range c.usedContext {
-		wg.Add(1)
-
-		//trigger cancel-func and wait for it
-		go func(c context.Context, cf context.CancelFunc) {
-			defer wg.Done()
-			cf()       //call cancel
-			<-c.Done() //wait for cancellation
-		}(ctx, cancelFunc)
+	c.closed = true
+	for _, cancel := range c.usedContext {
+		cancel()
 	}
+	c.lock.Unlock()
 
-	//wait for all commands to be stopped
 	done := make(chan struct{})
 	go func() {
-		wg.Wait()
 		c.openExecutions.Wait()
-
 		close(done)
 	}()
 
-	//wait for WaitGroup or Timeout
 	select {
 	case <-done:
 		return nil
