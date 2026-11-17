@@ -27,11 +27,11 @@ func newTestServer(t *testing.T) *httptest.Server {
 		Publisher: transport.NopPublisher{},
 	}
 	trigger.Initialise(1, 1, []config.Trigger{
-		{Name: "echo", Topic: "cmnd/echo", Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "echo done"}}},
-		{Name: "slow", Topic: "cmnd/slow", Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "sleep 3; echo late"}}},
-		{Name: "cat", Topic: "cmnd/cat", StdinPayload: true, Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "cat"}}},
-		{Name: "failing", Topic: "cmnd/failing", Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "echo bad >&2; exit 1"}}},
-		{Name: "timed", Topic: "cmnd/timed", Timeout: config.Interval(100 * time.Millisecond), Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "sleep 5; echo never"}}},
+		{Name: "Display echo", WebhookID: "echo", Topic: "cmnd/echo", Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "echo done"}}},
+		{Name: "Display slow", WebhookID: "slow", Topic: "cmnd/slow", Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "sleep 3; echo late"}}},
+		{Name: "Display cat", WebhookID: "cat", Topic: "cmnd/cat", StdinPayload: true, Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "cat"}}},
+		{Name: "Display failing", WebhookID: "failing", Topic: "cmnd/failing", Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "echo bad >&2; exit 1"}}},
+		{Name: "Display timed", WebhookID: "timed", Topic: "cmnd/timed", Timeout: config.Interval(100 * time.Millisecond), Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "sleep 5; echo never"}}},
 	})
 
 	sensor := &mqtt.SensorWorker{
@@ -255,7 +255,7 @@ func TestDocsEndpoints(t *testing.T) {
 
 	//the API surface (must match the mux routes in NewServer)
 	endpoints := []string{
-		"/trigger/{name}", "/trigger/{name}/run", "/trigger/{name}/stop", "/sensor/{name}", "/status", "/metrics",
+		"/trigger/{id}", "/trigger/{id}/run", "/trigger/{id}/stop", "/sensor/{name}", "/status", "/metrics",
 	}
 
 	docs, err := http.Get(ts.URL + "/docs")
@@ -310,4 +310,76 @@ func TestTriggerRunReturnsBeforeCompletionAndRejectsSecondStart(t *testing.T) {
 	require.NoError(t, err)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestTriggerRoutesRequireWebhookID(t *testing.T) {
+	ts := newTestServer(t)
+	for _, route := range []struct{ method, suffix string }{
+		{http.MethodPost, ""},
+		{http.MethodPost, "/run"},
+		{http.MethodDelete, ""},
+		{http.MethodPost, "/stop"},
+	} {
+		t.Run(route.method+route.suffix, func(t *testing.T) {
+			req, err := http.NewRequest(route.method, ts.URL+"/trigger/Display%20echo"+route.suffix, nil)
+			require.NoError(t, err)
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+		})
+	}
+}
+
+func TestDocsListsCurrentHTTPTriggers(t *testing.T) {
+	trigger := &mqtt.Trigger{Publisher: transport.NopPublisher{}}
+	handler := NewServer("", trigger, &mqtt.SensorWorker{}, time.Now()).Handler
+	readDocs := func() string {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/docs", nil))
+		require.Equal(t, http.StatusOK, response.Code)
+		assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+		return response.Body.String()
+	}
+
+	trigger.Initialise(1, 1, []config.Trigger{
+		{Name: "Zebra", Topic: "cmnd/zebra", WebhookID: "zebra"},
+		{Name: "A <b> & B", WebhookID: "first-hook"},
+		{Name: "MQTT only", Topic: "cmnd/private"},
+		{Name: "Disabled"},
+	})
+	beforeReload := readDocs()
+	require.Contains(t, beforeReload, `<select id="trigger-id" required>`)
+	first := `<option value="first-hook">A &lt;b&gt; &amp; B</option>`
+	last := `<option value="zebra">Zebra</option>`
+	require.Contains(t, beforeReload, first)
+	require.Contains(t, beforeReload, last)
+	assert.Less(t, strings.Index(beforeReload, first), strings.Index(beforeReload, last))
+	assert.NotContains(t, beforeReload, "MQTT only")
+	assert.NotContains(t, beforeReload, "Disabled")
+
+	trigger.Initialise(1, 1, []config.Trigger{{Name: "Replacement", WebhookID: "replacement"}})
+	afterReload := readDocs()
+	assert.Contains(t, afterReload, `<option value="replacement">Replacement</option>`)
+	assert.NotContains(t, afterReload, first)
+	assert.NotContains(t, afterReload, last)
+
+	trigger.Initialise(1, 1, []config.Trigger{{Name: "MQTT only", Topic: "cmnd/private"}})
+	withoutWebhooks := readDocs()
+	assert.Contains(t, withoutWebhooks, "No HTTP triggers configured.")
+	assert.NotContains(t, withoutWebhooks, `<select id="trigger-id"`)
+}
+
+func TestRootRedirectsToDocsOnly(t *testing.T) {
+	handler := NewServer("", &mqtt.Trigger{}, &mqtt.SensorWorker{}, time.Now()).Handler
+	root := httptest.NewRecorder()
+	handler.ServeHTTP(root, httptest.NewRequest(http.MethodGet, "/", nil))
+	assert.Equal(t, http.StatusFound, root.Code)
+	assert.Equal(t, "/docs", root.Header().Get("Location"))
+
+	unknown := httptest.NewRecorder()
+	handler.ServeHTTP(unknown, httptest.NewRequest(http.MethodGet, "/missing", nil))
+	assert.Equal(t, http.StatusNotFound, unknown.Code)
+	assert.Empty(t, unknown.Header().Get("Location"))
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestLoadTopicConfiguration(t *testing.T) {
@@ -262,7 +263,7 @@ trigger:
 			expectedError: "invalid config: invalid trigger (#0): invalid topic: invalid character",
 		},
 		{
-			name: "Trigger empty topic",
+			name: "Disabled trigger without topic or webhook ID",
 			content: `
 trigger:
   - name: My sweat sensor
@@ -270,7 +271,12 @@ trigger:
       name: /usr/bin/bash
       arguments: [echo]
 `,
-			expectedError: "invalid config: invalid trigger (#0): invalid topic: must not be empty",
+			expectedResult: TopicConfigurations{
+				Trigger: []Trigger{{
+					Name:    "My sweat sensor",
+					Command: Command{Name: "/usr/bin/bash", Arguments: []string{"echo"}},
+				}},
+			},
 		},
 		{
 			name: "Trigger empty command",
@@ -444,4 +450,20 @@ func testFile(content string) *os.File {
 func interval(d time.Duration) *Interval {
 	i := Interval(d)
 	return &i
+}
+
+func TestTriggerWebhookIDsAndDormantRunTopic(t *testing.T) {
+	conf := TopicConfigurations{Trigger: []Trigger{
+		{Name: "MQTT only", Topic: "cmd/one", RunTopic: "cmd/run", Command: Command{Name: "/bin/echo"}},
+		{Name: "Webhook only", WebhookID: "two-2", RunTopic: "cmd/run", Command: Command{Name: "/bin/echo"}},
+		{Name: "Disabled", RunTopic: "cmd/run", Command: Command{Name: "intentionally-unavailable-binary"}},
+	}}
+	require.NoError(t, conf.validate())
+	require.NoError(t, conf.validateRequestTopics())
+	require.NoError(t, conf.ValidateCommands())
+
+	conf.Trigger[0].WebhookID = "two-2"
+	require.ErrorContains(t, conf.validate(), "duplicate webhook_id")
+	conf.Trigger[0].WebhookID = "Upper/Two"
+	require.ErrorContains(t, conf.validate(), "invalid webhook_id")
 }

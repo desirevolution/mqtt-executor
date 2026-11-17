@@ -138,7 +138,8 @@ func TestTwoRapidStartsRunCommandOnce(t *testing.T) {
 	}
 	triggerConf.Topic = "cmnd/test"
 	tr.triggersByName = map[string]config.Trigger{triggerConf.Name: triggerConf}
-	handler := tr.triggerHandler(triggerConf.Name, 0, false)
+	tr.generation = 1
+	handler := tr.triggerHandler(triggerConf.Name, tr.generation, false)
 
 	handler(nil, fakeMqttMessage{topic: "cmnd/test", payload: []byte(PayloadStart)})
 	handler(nil, fakeMqttMessage{topic: "cmnd/test", payload: []byte(PayloadStart)})
@@ -161,7 +162,8 @@ func TestStartAfterCompletionRunsAgain(t *testing.T) {
 	}
 	triggerConf.Topic = "cmnd/test"
 	tr.triggersByName = map[string]config.Trigger{triggerConf.Name: triggerConf}
-	handler := tr.triggerHandler(triggerConf.Name, 0, false)
+	tr.generation = 1
+	handler := tr.triggerHandler(triggerConf.Name, tr.generation, false)
 
 	handler(nil, fakeMqttMessage{topic: "cmnd/test", payload: []byte(PayloadStart)})
 	pub.waitUntilStopped(t, "cmnd/test/STATE")
@@ -212,13 +214,14 @@ func TestStopConcurrentWithCompletion(t *testing.T) {
 	}
 	triggerConf.Topic = "cmnd/test"
 	tr.triggersByName = map[string]config.Trigger{triggerConf.Name: triggerConf}
-	handler := tr.triggerHandler(triggerConf.Name, 0, false)
+	tr.generation = 1
+	handler := tr.triggerHandler(triggerConf.Name, tr.generation, false)
 
 	for i := 0; i < 50; i++ {
 		handler(nil, fakeMqttMessage{topic: "cmnd/test", payload: []byte(PayloadStart)})
 		//hammer STOP while the command may finish at any moment
 		for j := 0; j < 5; j++ {
-			tr.Stop(triggerConf.Name)
+			tr.stop(triggerConf.Name, tr.generation)
 		}
 		pub.waitUntilStoppedCount(t, "cmnd/test/STATE", i+1)
 		waitUntilTriggerIdle(t, tr, triggerConf.Name)
@@ -239,6 +242,7 @@ func TestTriggerTimeoutInterruptsCommand(t *testing.T) {
 		Command: config.Command{Name: "/bin/sh", Arguments: []string{"-c", "sleep 5; echo never"}},
 	}
 	tr.triggersByName = map[string]config.Trigger{"test": triggerConf}
+	tr.webhookNames = map[string]string{"test": "test"}
 
 	start := time.Now()
 	state, result, err := tr.StartSync("test", nil)
@@ -263,17 +267,17 @@ func TestInitialiseSwapsConfiguration(t *testing.T) {
 	tr := newTestTrigger(pub)
 
 	first := []config.Trigger{{
-		Name: "first", Topic: "cmnd/first",
+		Name: "first", WebhookID: "first", Topic: "cmnd/first",
 		Command: config.Command{Name: "/bin/echo", Arguments: []string{"one"}},
 	}}
 	second := []config.Trigger{{
-		Name: "second", Topic: "cmnd/second",
+		Name: "second", WebhookID: "second", Topic: "cmnd/second",
 		Command: config.Command{Name: "/bin/echo", Arguments: []string{"two"}},
 	}}
 
 	tr.Initialise(1, 1, first)
-	assert.True(t, tr.Exists("first"))
-	assert.False(t, tr.Exists("second"))
+	assert.True(t, tr.HasWebhook("first"))
+	assert.False(t, tr.HasWebhook("second"))
 
 	//concurrent lookups while swapping (no -race here, but this must at
 	//least not panic and stay consistent)
@@ -281,14 +285,14 @@ func TestInitialiseSwapsConfiguration(t *testing.T) {
 	go func() {
 		for i := 0; i < 200; i++ {
 			_, _, _ = tr.StartSync("first", nil)
-			_ = tr.Exists("second")
+			_ = tr.HasWebhook("second")
 		}
 		close(done)
 	}()
 
 	tr.Initialise(1, 1, second)
-	assert.True(t, tr.Exists("second"))
-	assert.False(t, tr.Exists("first"))
+	assert.True(t, tr.HasWebhook("second"))
+	assert.False(t, tr.HasWebhook("first"))
 
 	_, _, err := tr.StartSync("first", nil)
 	assert.ErrorIs(t, err, ErrUnknownTrigger)
@@ -312,7 +316,8 @@ func TestStopInterruptsRunningCommand(t *testing.T) {
 	}
 	triggerConf.Topic = "cmnd/test"
 	tr.triggersByName = map[string]config.Trigger{triggerConf.Name: triggerConf}
-	handler := tr.triggerHandler(triggerConf.Name, 0, false)
+	tr.generation = 1
+	handler := tr.triggerHandler(triggerConf.Name, tr.generation, false)
 
 	handler(nil, fakeMqttMessage{topic: "cmnd/test", payload: []byte(PayloadStart)})
 	require.Eventually(t, func() bool {
@@ -347,7 +352,7 @@ func TestStopKeepsTriggerBusyUntilPreviousRunFinishes(t *testing.T) {
 	pub := &blockedTriggerResult{publishing: make(chan struct{}), finish: make(chan struct{})}
 	tr := newTestTrigger(pub)
 	tr.Initialise(1, 1, []config.Trigger{{
-		Name: "test", Topic: "cmnd/test", Command: config.Command{Name: "/bin/sleep", Arguments: []string{"30"}},
+		Name: "test", WebhookID: "test", Topic: "cmnd/test", Command: config.Command{Name: "/bin/sleep", Arguments: []string{"30"}},
 	}})
 	t.Cleanup(func() { assert.NoError(t, tr.Executor.Close(time.Second)) })
 

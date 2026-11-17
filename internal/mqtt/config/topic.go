@@ -30,11 +30,12 @@ type availabilityPayload struct {
 }
 
 type Trigger struct {
-	Name     string  `yaml:"name"`
-	Topic    string  `yaml:"topic"`
-	RunTopic string  `yaml:"run_topic"`
-	Icon     string  `yaml:"icon"`
-	Command  Command `yaml:"command"`
+	Name      string  `yaml:"name"`
+	Topic     string  `yaml:"topic"`
+	RunTopic  string  `yaml:"run_topic"`
+	WebhookID string  `yaml:"webhook_id"`
+	Icon      string  `yaml:"icon"`
+	Command   Command `yaml:"command"`
 	// StdinPayload: pass the incoming payload (MQTT message body / webhook
 	// request body) to the command as stdin
 	StdinPayload bool `yaml:"stdin_payload"`
@@ -198,6 +199,7 @@ func (t *TopicConfigurations) validate() error {
 	}
 
 	triggerNames := map[string]bool{}
+	webhookIDs := map[string]bool{}
 	for i, trigger := range t.Trigger {
 		if err := validateTrigger(trigger); err != nil {
 			return fmt.Errorf("invalid trigger (#%d): %w", i, err)
@@ -207,6 +209,12 @@ func (t *TopicConfigurations) validate() error {
 			return fmt.Errorf("invalid trigger (#%d): trigger with this name already exists", i)
 		}
 		triggerNames[trigger.Name] = true
+		if trigger.WebhookID != "" {
+			if webhookIDs[trigger.WebhookID] {
+				return fmt.Errorf("duplicate webhook_id %q", trigger.WebhookID)
+			}
+			webhookIDs[trigger.WebhookID] = true
+		}
 	}
 
 	return nil
@@ -257,12 +265,19 @@ func validateGeneralSensor(sensor GeneralSensor) error {
 	return nil
 }
 
+var webhookIDPattern = regexp.MustCompile(`^[a-z0-9-]+$`)
+
 func validateTrigger(trigger Trigger) error {
 	if trigger.Name == "" {
 		return errors.New("name must not be empty")
 	}
-	if err := checkTopicName(trigger.Topic); err != nil {
-		return fmt.Errorf("invalid topic: %w", err)
+	if trigger.Topic != "" {
+		if err := checkTopicName(trigger.Topic); err != nil {
+			return fmt.Errorf("invalid topic: %w", err)
+		}
+	}
+	if trigger.WebhookID != "" && !webhookIDPattern.MatchString(trigger.WebhookID) {
+		return fmt.Errorf("invalid webhook_id %q: use lowercase letters, digits and hyphens", trigger.WebhookID)
 	}
 	if trigger.RunTopic != "" {
 		if err := checkTopicName(trigger.RunTopic); err != nil {
@@ -286,6 +301,9 @@ func (t *TopicConfigurations) validateRequestTopics() error {
 		used[t.Availability.Topic] = true
 	}
 	for _, trigger := range t.Trigger {
+		if trigger.Topic == "" {
+			continue
+		}
 		used[trigger.Topic] = true
 		used[trigger.Topic+"/STATE"] = true
 		used[trigger.Topic+"/RESULT"] = true
@@ -295,7 +313,10 @@ func (t *TopicConfigurations) validateRequestTopics() error {
 		used[sensor.ResultTopic] = true
 	}
 	for _, trigger := range t.Trigger {
-		if trigger.RunTopic != "" && used[trigger.RunTopic] {
+		if trigger.Topic == "" || trigger.RunTopic == "" {
+			continue
+		}
+		if used[trigger.RunTopic] {
 			return fmt.Errorf("run_topic %q is already used", trigger.RunTopic)
 		}
 		used[trigger.RunTopic] = true
@@ -340,7 +361,9 @@ func (t *TopicConfigurations) ValidateCommands() error {
 		}
 	}
 	for _, trigger := range t.Trigger {
-		collect(trigger.Command)
+		if trigger.Topic != "" || trigger.WebhookID != "" {
+			collect(trigger.Command)
+		}
 	}
 	for _, sensor := range t.Sensor {
 		collect(sensor.Command)

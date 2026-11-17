@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ type Trigger struct {
 	generation      uint64
 	runningCommands map[string]*triggerRun
 	triggersByName  map[string]config.Trigger
+	webhookNames    map[string]string // webhook ID to configured trigger name
 	subscriptions   map[string]MQTT.MessageHandler
 	subscribeQOS    byte
 	publishQOS      byte
@@ -45,20 +47,32 @@ type Trigger struct {
 // Initialise applies the configuration. Existing runs own their name until
 // completion, including across a reload.
 func (t *Trigger) Initialise(subscribeQOS, publishQOS byte, configs []config.Trigger) {
+	t.statusMu.Lock()
 	t.lock.Lock()
 	t.generation++
 	t.subscribeQOS = subscribeQOS
 	t.publishQOS = publishQOS
 	t.subscriptions = make(map[string]MQTT.MessageHandler)
 	t.triggersByName = make(map[string]config.Trigger, len(configs))
+	t.webhookNames = make(map[string]string)
 	for _, conf := range configs {
 		t.triggersByName[conf.Name] = conf
+		if conf.WebhookID != "" {
+			t.webhookNames[conf.WebhookID] = conf.Name
+		}
+		if conf.Topic == "" {
+			if conf.WebhookID == "" {
+				slog.Warn("Trigger disabled: neither topic nor webhook_id is configured", "trigger", conf.Name)
+			}
+			continue
+		}
 		t.subscriptions[conf.Topic] = t.triggerHandler(conf.Name, t.generation, false)
 		if conf.RunTopic != "" {
 			t.subscriptions[conf.RunTopic] = t.triggerHandler(conf.Name, t.generation, true)
 		}
 	}
 	t.lock.Unlock()
+	t.statusMu.Unlock()
 
 	t.ReInitialise()
 }
@@ -73,6 +87,9 @@ func (t *Trigger) ReInitialise() {
 	subQOS, pubQOS := t.subscribeQOS, t.publishQOS
 	states := make(map[string]string, len(t.triggersByName))
 	for name, conf := range t.triggersByName {
+		if conf.Topic == "" {
+			continue
+		}
 		state := PayloadStatusStopped
 		if t.runningCommands[name] != nil {
 			state = PayloadStatusRunning
@@ -97,15 +114,36 @@ func (t *Trigger) IsInitialised() bool {
 	return t.triggersByName != nil
 }
 
-func (t *Trigger) Exists(name string) bool {
+// WebhookTrigger is the display name and URL ID of an HTTP-enabled trigger.
+type WebhookTrigger struct {
+	ID   string
+	Name string
+}
+
+// Webhooks returns a sorted snapshot of the active HTTP trigger configuration.
+func (t *Trigger) Webhooks() []WebhookTrigger {
+	t.lock.RLock()
+	hooks := make([]WebhookTrigger, 0, len(t.webhookNames))
+	for id, name := range t.webhookNames {
+		hooks = append(hooks, WebhookTrigger{ID: id, Name: name})
+	}
+	t.lock.RUnlock()
+
+	slices.SortFunc(hooks, func(a, b WebhookTrigger) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return hooks
+}
+
+func (t *Trigger) HasWebhook(id string) bool {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
-	_, ok := t.triggersByName[name]
+	_, ok := t.webhookNames[id]
 	return ok
 }
 
-func (t *Trigger) StartSync(name string, payload []byte) (state, result string, err error) {
-	conf, run, err := t.start(name, 0)
+func (t *Trigger) StartSync(webhookID string, payload []byte) (state, result string, err error) {
+	conf, run, err := t.start(webhookID, 0)
 	if errors.Is(err, ErrAlreadyRunning) {
 		return PayloadStatusRunning, "", err
 	}
@@ -116,8 +154,8 @@ func (t *Trigger) StartSync(name string, payload []byte) (state, result string, 
 	return PayloadStatusStopped, result, err
 }
 
-func (t *Trigger) StartAsync(name string, payload []byte) error {
-	return t.startAsync(name, payload, 0)
+func (t *Trigger) StartAsync(webhookID string, payload []byte) error {
+	return t.startAsync(webhookID, payload, 0)
 }
 
 func (t *Trigger) startAsync(name string, payload []byte, generation uint64) error {
@@ -132,15 +170,15 @@ func (t *Trigger) startAsync(name string, payload []byte, generation uint64) err
 	return nil
 }
 
-func (t *Trigger) start(name string, generation uint64) (config.Trigger, *triggerRun, error) {
+func (t *Trigger) start(key string, generation uint64) (config.Trigger, *triggerRun, error) {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	conf, ok := t.triggersByName[name]
-	if !ok || (generation != 0 && generation != t.generation) {
+	conf, ok := t.resolveTrigger(key, generation)
+	if !ok {
 		return config.Trigger{}, nil, ErrUnknownTrigger
 	}
-	if t.runningCommands[name] != nil {
+	if t.runningCommands[conf.Name] != nil {
 		return config.Trigger{}, nil, ErrAlreadyRunning
 	}
 	if t.runningCommands == nil {
@@ -148,22 +186,23 @@ func (t *Trigger) start(name string, generation uint64) (config.Trigger, *trigge
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	run := &triggerRun{ctx: ctx, cancel: cancel}
-	t.runningCommands[name] = run
+	t.runningCommands[conf.Name] = run
 	return conf, run, nil
 }
 
-func (t *Trigger) Stop(name string) (exists, stopped bool) {
-	return t.stop(name, 0)
+func (t *Trigger) Stop(webhookID string) (exists, stopped bool) {
+	return t.stop(webhookID, 0)
 }
 
-func (t *Trigger) stop(name string, generation uint64) (exists, stopped bool) {
+func (t *Trigger) stop(key string, generation uint64) (exists, stopped bool) {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	if _, ok := t.triggersByName[name]; !ok || (generation != 0 && generation != t.generation) {
+	conf, ok := t.resolveTrigger(key, generation)
+	if !ok {
 		return false, false
 	}
-	run := t.runningCommands[name]
+	run := t.runningCommands[conf.Name]
 	if run == nil || run.ctx.Err() != nil {
 		return true, false
 	}
@@ -171,6 +210,21 @@ func (t *Trigger) stop(name string, generation uint64) (exists, stopped bool) {
 	// finish. STOP cannot make a replacement overlap with the old run.
 	run.cancel()
 	return true, true
+}
+
+// resolveTrigger is called with lock held. HTTP resolves by its explicit ID;
+// MQTT handlers carry the configuration generation they were registered for.
+func (t *Trigger) resolveTrigger(key string, generation uint64) (config.Trigger, bool) {
+	if generation == 0 {
+		name, ok := t.webhookNames[key]
+		if !ok {
+			return config.Trigger{}, false
+		}
+		conf, ok := t.triggersByName[name]
+		return conf, ok
+	}
+	conf, ok := t.triggersByName[key]
+	return conf, ok && generation == t.generation && conf.Topic != ""
 }
 
 func (t *Trigger) triggerHandler(name string, generation uint64, impulse bool) MQTT.MessageHandler {
@@ -210,25 +264,26 @@ func (t *Trigger) execute(conf config.Trigger, run *triggerRun, payload []byte) 
 	}
 
 	t.statusMu.Lock()
-	t.publish(conf.Topic+"/"+TopicSuffixState, t.qos(), PayloadStatusRunning)
+	t.publishTrigger(conf.Name, TopicSuffixState, PayloadStatusRunning)
 	t.statusMu.Unlock()
 
 	output, err := metrics.Instrument(metrics.EntityTypeTrigger, conf.Name, func() ([]byte, error) {
 		return t.Executor.ExecuteCommandWithStdin(conf.Command.Name, conf.Command.Arguments, ctx, stdin)
 	})
-	topic := conf.Topic + "/" + TopicSuffixResult
+	var result any = output
+	text := string(output)
 	switch {
-	case err == nil:
-		t.publish(topic, t.qos(), output)
-		return string(output), nil
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		t.publish(topic, t.qos(), PayloadResultInterrupted)
-		return PayloadResultInterrupted, err
-	default:
-		result := PayloadResultFailedPrefix + err.Error()
-		t.publish(topic, t.qos(), result)
-		return result, err
+		text = PayloadResultInterrupted
+		result = text
+	case err != nil:
+		text = PayloadResultFailedPrefix + err.Error()
+		result = text
 	}
+	t.statusMu.Lock()
+	t.publishTrigger(conf.Name, TopicSuffixResult, result)
+	t.statusMu.Unlock()
+	return text, err
 }
 
 func (t *Trigger) finish(conf config.Trigger, run *triggerRun) {
@@ -236,15 +291,7 @@ func (t *Trigger) finish(conf config.Trigger, run *triggerRun) {
 	t.statusMu.Lock()
 	defer t.statusMu.Unlock()
 
-	t.lock.RLock()
-	current, configured := t.triggersByName[conf.Name]
-	qos := t.publishQOS
-	t.lock.RUnlock()
-
-	t.publish(conf.Topic+"/"+TopicSuffixState, qos, PayloadStatusStopped)
-	if configured && current.Topic != conf.Topic {
-		t.publish(current.Topic+"/"+TopicSuffixState, qos, PayloadStatusStopped)
-	}
+	t.publishTrigger(conf.Name, TopicSuffixState, PayloadStatusStopped)
 
 	t.lock.Lock()
 	if t.runningCommands[conf.Name] == run {
@@ -259,10 +306,17 @@ func (t *Trigger) publish(topic string, qos byte, payload any) {
 	}
 }
 
-func (t *Trigger) qos() byte {
+// publishTrigger is called with statusMu held, so a config swap cannot
+// disable or move the MQTT route between resolving and publishing it.
+func (t *Trigger) publishTrigger(name, suffix string, payload any) {
 	t.lock.RLock()
-	defer t.lock.RUnlock()
-	return t.publishQOS
+	topic := t.triggersByName[name].Topic
+	qos := t.publishQOS
+	t.lock.RUnlock()
+
+	if topic != "" {
+		t.publish(topic+"/"+suffix, qos, payload)
+	}
 }
 
 func (t *Trigger) Close(_ time.Duration) error {

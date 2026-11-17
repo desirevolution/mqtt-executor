@@ -58,6 +58,7 @@ availability:
 trigger:
   - name: Touch file
     topic: cmnd/touch/file        # MQTT: send START / STOP here
+    webhook_id: touch-file        # HTTP: /trigger/touch-file
     run_topic: cmnd/touch/file/run # optional MQTT impulse with an optional payload
     timeout: 30s                  # optional, interrupt after 30s
     stdin_payload: true           # optional: message body / webhook body → stdin
@@ -99,10 +100,17 @@ multi_sensor:
 
 Notes:
 
+- `topic` enables MQTT for a trigger. `webhook_id` enables its HTTP routes.
+  Set both fields to expose both interfaces. Webhook IDs must be unique and
+  use lowercase letters, digits or hyphens. Existing HTTP callers must switch
+  from display names to explicitly configured webhook IDs.
+- Omit both fields to disable a trigger while keeping its definition. Startup
+  and reload log a warning. After a reload, an in-flight command may finish.
+  Without `topic`, a configured `run_topic` is inactive.
 - `__DEVICE_ID__` in topics is replaced with the device id (see flags).
 - The config is parsed **strictly**: unknown keys are a startup error (typos
   fail fast).
-- All configured commands must exist and be executable at startup
+- Commands for enabled triggers and sensors must exist and be executable at startup
   (`exec.LookPath` / path check) — missing commands abort the start.
 - `interval` and `timeout` accept Go durations (`10s`, `1m30s`, …).
 - Omit `interval` for an on-demand sensor. A single HTTP-only sensor needs
@@ -142,23 +150,26 @@ mqtt-executor -broker tcp://127.0.0.1:1883 -config /path/to/config.yaml -home-as
 # Webhook API
 
 The webhook API supports synchronous and asynchronous trigger starts.
-MQTT state and result publications also apply to HTTP calls in broker mode. An
-interactive playground is served at **`/docs`**, the machine-readable
-description at **`/openapi.yaml`** — both embedded, no external assets.
+HTTP trigger URLs use `webhook_id`. With both `topic` and a broker configured,
+HTTP calls also publish trigger state and results to MQTT. An
+interactive playground is served at **`/docs`**. Opening **`/`** redirects there.
+Its dropdown lists the currently configured HTTP triggers by display name.
+Reload the page after changing the trigger configuration. The generic
+OpenAPI description is served at **`/openapi.yaml`**.
 
 ```bash
 # start a trigger and wait for the result
-curl -X POST 'http://127.0.0.1:8080/trigger/Touch%20file'
+curl -X POST 'http://127.0.0.1:8080/trigger/touch-file'
 # → {"state":"STOPPED","result":"..."}
 
 # start asynchronously (HTTP 202)
-curl -i -X POST 'http://127.0.0.1:8080/trigger/Touch%20file/run'
+curl -i -X POST 'http://127.0.0.1:8080/trigger/touch-file/run'
 
 # pass a payload to the command (stdin_payload: true)
 curl -X POST http://127.0.0.1:8080/trigger/github -d '{"action":"push"}'
 
-# interrupt a running trigger (idempotent; alias: POST /trigger/<name>/stop)
-curl -X DELETE 'http://127.0.0.1:8080/trigger/Touch%20file'
+# interrupt a running trigger (idempotent; alias: POST /trigger/<id>/stop)
+curl -X DELETE 'http://127.0.0.1:8080/trigger/touch-file'
 
 # run a sensor command on demand (also published to MQTT, if broker)
 curl 'http://127.0.0.1:8080/sensor/Free%20Memory'
@@ -169,7 +180,7 @@ curl http://127.0.0.1:8080/metrics
 ```
 
 The synchronous start returns `200` when finished or interrupted.
-`POST /trigger/{name}/run` returns `202` when accepted and has no execution
+`POST /trigger/{id}/run` returns `202` when accepted and has no execution
 ID. Both start routes accept an optional raw body (up to 1 MiB) and report
 `404` for unknown triggers or `409` while an execution is active. A failing
 command returns `500` with `<FAILED>;` on synchronous calls. A trigger timeout

@@ -1,11 +1,13 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"log/slog"
 	"net/http"
@@ -17,10 +19,12 @@ import (
 	"github.com/rainu/mqtt-executor/internal/mqtt"
 )
 
-// static API documentation, embedded into the binary (offline-capable)
+// API documentation assets, embedded for offline use.
 //
 //go:embed openapi.yaml docs.html
 var staticFiles embed.FS
+
+var docsTemplate = template.Must(template.ParseFS(staticFiles, "docs.html"))
 
 const maxBodySize = 1 << 20 // 1 MiB
 
@@ -56,15 +60,18 @@ func NewServer(addr string, trigger *mqtt.Trigger, sensor *mqtt.SensorWorker, st
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /trigger/{name}", s.handleTriggerStart)
-	mux.HandleFunc("POST /trigger/{name}/run", s.handleTriggerRun)
-	mux.HandleFunc("DELETE /trigger/{name}", s.handleTriggerStop)
-	mux.HandleFunc("POST /trigger/{name}/stop", s.handleTriggerStop) //alias for DELETE
+	mux.HandleFunc("POST /trigger/{id}", s.handleTriggerStart)
+	mux.HandleFunc("POST /trigger/{id}/run", s.handleTriggerRun)
+	mux.HandleFunc("DELETE /trigger/{id}", s.handleTriggerStop)
+	mux.HandleFunc("POST /trigger/{id}/stop", s.handleTriggerStop) //alias for DELETE
 	mux.HandleFunc("GET /sensor/{name}", s.handleSensor)
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.Handle("GET /metrics", promhttp.Handler())
 	mux.HandleFunc("GET /openapi.yaml", serveStatic("openapi.yaml", "application/x-yaml; charset=utf-8"))
-	mux.HandleFunc("GET /docs", serveStatic("docs.html", "text/html; charset=utf-8"))
+	mux.HandleFunc("GET /docs", s.handleDocs)
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/docs", http.StatusFound)
+	})
 
 	s.Server = http.Server{
 		Addr:    addr,
@@ -83,15 +90,15 @@ func NewServer(addr string, trigger *mqtt.Trigger, sensor *mqtt.SensorWorker, st
 // completion. The request body is the payload (passed to the command as stdin
 // if configured with stdin_payload).
 func (s *Server) handleTriggerStart(w http.ResponseWriter, r *http.Request) {
-	name, body, ok := s.readTriggerRequest(w, r)
+	id, body, ok := s.readTriggerRequest(w, r)
 	if !ok {
 		return
 	}
 
-	state, result, err := s.Trigger.StartSync(name, body)
+	state, result, err := s.Trigger.StartSync(id, body)
 	switch {
 	case errors.Is(err, mqtt.ErrUnknownTrigger):
-		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown trigger %q", name))
+		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown trigger %q", id))
 	case errors.Is(err, mqtt.ErrAlreadyRunning):
 		writeJSON(w, http.StatusConflict, triggerResponse{State: mqtt.PayloadStatusRunning})
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
@@ -107,13 +114,13 @@ func (s *Server) handleTriggerStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
-	name, body, ok := s.readTriggerRequest(w, r)
+	id, body, ok := s.readTriggerRequest(w, r)
 	if !ok {
 		return
 	}
-	switch err := s.Trigger.StartAsync(name, body); {
+	switch err := s.Trigger.StartAsync(id, body); {
 	case errors.Is(err, mqtt.ErrUnknownTrigger):
-		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown trigger %q", name))
+		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown trigger %q", id))
 	case errors.Is(err, mqtt.ErrAlreadyRunning):
 		writeJSON(w, http.StatusConflict, triggerResponse{State: mqtt.PayloadStatusRunning})
 	case err != nil:
@@ -124,12 +131,12 @@ func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) readTriggerRequest(w http.ResponseWriter, r *http.Request) (string, []byte, bool) {
-	name := r.PathValue("name")
+	id := r.PathValue("id")
 
 	//existence check before reading the body: reject unknown triggers
 	//without consuming the (up to 1 MiB) payload
-	if !s.Trigger.Exists(name) {
-		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown trigger %q", name))
+	if !s.Trigger.HasWebhook(id) {
+		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown trigger %q", id))
 		return "", nil, false
 	}
 
@@ -139,21 +146,21 @@ func (s *Server) readTriggerRequest(w http.ResponseWriter, r *http.Request) (str
 		return "", nil, false
 	}
 
-	return name, body, true
+	return id, body, true
 }
 
 // handleTriggerStop interrupts a running command. It is idempotent: stopping
 // a not-running (but existing) trigger responds with 200.
 func (s *Server) handleTriggerStop(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
+	id := r.PathValue("id")
 
-	exists, stopped := s.Trigger.Stop(name)
+	exists, stopped := s.Trigger.Stop(id)
 	if !exists {
-		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown trigger %q", name))
+		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown trigger %q", id))
 		return
 	}
 	if stopped {
-		slog.Info("Trigger stopped via webhook", "trigger", name)
+		slog.Info("Trigger stopped via webhook", "webhook_id", id)
 	}
 	writeJSON(w, http.StatusOK, triggerResponse{State: mqtt.PayloadStatusStopped})
 }
@@ -192,6 +199,18 @@ func (s *Server) Close(timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return s.Server.Shutdown(ctx)
+}
+
+func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
+	var page bytes.Buffer
+	if err := docsTemplate.Execute(&page, s.Trigger.Webhooks()); err != nil {
+		slog.Error("Failed to render API playground", "error", err)
+		httpError(w, http.StatusInternalServerError, "could not render API playground")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write(page.Bytes())
 }
 
 // serveStatic serves an embedded API documentation file.

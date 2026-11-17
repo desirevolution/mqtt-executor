@@ -8,10 +8,10 @@
   body { font-family: system-ui, -apple-system, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #222; }
   h1 { font-size: 1.4rem; } h2 { font-size: 1.05rem; margin-top: 2rem; }
   .method { display: inline-block; font-weight: bold; padding: 2px 8px; border-radius: 4px; color: #fff; margin-right: 4px; }
-  .post { background: #49cc90; } .get { background: #61affe; } .delete { background: #f93e3e; }
+  .get { background: #61affe; }
   fieldset { border: 1px solid #ddd; border-radius: 6px; margin: 0 0 1rem; }
-  input, textarea, button { font: inherit; padding: 4px 8px; margin: 4px 0; }
-  input[type=text] { width: 14em; } textarea { width: 98%; min-height: 4em; display: block; }
+  input, select, textarea, button { font: inherit; padding: 4px 8px; margin: 4px 0; }
+  input[type=text] { width: 14em; } select { max-width: 100%; } textarea { width: 98%; min-height: 4em; display: block; }
   button { cursor: pointer; }
   pre { background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px; padding: 8px; white-space: pre-wrap; word-break: break-word; max-height: 20em; overflow: auto; }
   code { background: #f5f5f5; padding: 1px 4px; border-radius: 3px; }
@@ -20,27 +20,28 @@
 <body>
 <h1>mqtt-executor — API playground</h1>
 <p>HTTP ingress next to MQTT. <a href="/openapi.yaml">OpenAPI spec</a>.
-MQTT side effects (STATE/RESULT, sensor publishes) apply when a broker is configured.</p>
+Trigger URLs use the configured <code>webhook_id</code>. MQTT updates require a broker and a configured topic.</p>
 
-<h2><span class="method post">POST</span> /trigger/{name}</h2>
-<p>Starts the command and waits for its completion. The body is passed to the
-command as stdin when the trigger is configured with <code>stdin_payload: true</code>.</p>
+<h2>Triggers</h2>
+<p><code>POST /trigger/{id}</code> waits for the result. <code>POST /trigger/{id}/run</code>
+returns on acceptance. <code>DELETE /trigger/{id}</code> stops a run.
+<code>POST /trigger/{id}/stop</code> also stops a run.</p>
+{{if .}}
 <fieldset>
-  <input type="text" id="trigger-name" placeholder="trigger name">
-  <textarea id="trigger-body" placeholder="payload (optional; → stdin if configured)"></textarea>
-  <button onclick="startTrigger(false)">Start and wait</button>
-  <button onclick="startTrigger(true)">Start in background</button>
-  <p>The background button calls <code>POST /trigger/{name}/run</code> and returns when accepted.</p>
-  <pre id="trigger-out" hidden></pre>
+  <label for="trigger-id">Trigger</label>
+  <select id="trigger-id" required>
+    <option value="" selected disabled>Choose a trigger</option>
+    {{range .}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+  </select>
+  <textarea id="trigger-body" aria-label="Payload" placeholder="Optional payload (passed to stdin when enabled)"></textarea>
+  <button type="button" onclick="startTrigger(false)">Start and wait</button>
+  <button type="button" onclick="startTrigger(true)">Start in background</button>
+  <button type="button" onclick="stopTrigger()">Stop</button>
+  <pre id="trigger-out" hidden aria-live="polite"></pre>
 </fieldset>
-
-<h2><span class="method delete">DELETE</span> /trigger/{name}</h2>
-<p>Interrupts a running command (idempotent). Alias: <code>POST /trigger/{name}/stop</code>.</p>
-<fieldset>
-  <input type="text" id="stop-name" placeholder="trigger name">
-  <button onclick="stopTrigger()">Stop</button>
-  <pre id="stop-out" hidden></pre>
-</fieldset>
+{{else}}
+<p>No HTTP triggers configured. Set <code>webhook_id</code> on a trigger to enable its HTTP routes.</p>
+{{end}}
 
 <h2><span class="method get">GET</span> /sensor/{name}</h2>
 <p>Starts or joins a measurement and returns the output.</p>
@@ -69,8 +70,22 @@ async function call(method, path, body, outId) {
     out.textContent = 'request failed: ' + err;
   }
 }
-const startTrigger = (background) => call('POST', '/trigger/' + encodeURIComponent(document.getElementById('trigger-name').value) + (background ? '/run' : ''), document.getElementById('trigger-body').value, 'trigger-out');
-const stopTrigger = () => call('DELETE', '/trigger/' + encodeURIComponent(document.getElementById('stop-name').value), null, 'stop-out');
+function selectedTriggerPath() {
+  const select = document.getElementById('trigger-id');
+  if (!select.reportValidity()) return null;
+  return '/trigger/' + encodeURIComponent(select.value);
+}
+function startTrigger(background) {
+  const path = selectedTriggerPath();
+  if (!path) return;
+  const body = document.getElementById('trigger-body').value;
+  return call('POST', path + (background ? '/run' : ''), body, 'trigger-out');
+}
+function stopTrigger() {
+  const path = selectedTriggerPath();
+  if (!path) return;
+  return call('DELETE', path, null, 'trigger-out');
+}
 const querySensor = () => call('GET', '/sensor/' + encodeURIComponent(document.getElementById('sensor-name').value), null, 'sensor-out');
 const get = (path, outId) => call('GET', path, null, outId);
 </script>

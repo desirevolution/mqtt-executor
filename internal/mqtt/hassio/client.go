@@ -113,6 +113,9 @@ func (c *Client) PublishDiscoveryConfig(config config.TopicConfigurations) error
 
 	//trigger
 	for _, trigger := range config.Trigger {
+		if trigger.Topic == "" {
+			continue
+		}
 		targetTopic := fmt.Sprintf("%sswitch/%s/%s/config", c.TopicPrefix, c.DeviceId, friendlyName(trigger.Name))
 		payload, err := c.generateSwitchPayloadForTriggerAction(config.Availability, trigger)
 		if err != nil {
