@@ -40,7 +40,7 @@ jobs:
           GOARM: ${{ matrix.go-arm }}
           BINARY: mqtt-executor-${{ matrix.target }}
           VERSION: ${{ github.ref_name }}
-        run: go build -ldflags "-X main.versionTag=$VERSION" -o "$BINARY" ./cmd/mqtt-executor/
+        run: go build -ldflags "-s -w -X main.versionTag=$VERSION" -o "$BINARY" ./cmd/mqtt-executor/
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
