@@ -13,11 +13,17 @@ jobs:
     name: Build
     strategy:
       matrix:
-        go-os: [linux, windows]
-        go-arch: [386, amd64, arm, arm64]
-        exclude:
-          - go-os: windows
+        include:
+          - target: linux-amd64
+            go-arch: amd64
+          - target: linux-arm64
             go-arch: arm64
+          - target: linux-armv7
+            go-arch: arm
+            go-arm: '7'
+          - target: linux-armv6
+            go-arch: arm
+            go-arm: '6'
     runs-on: ubuntu-latest
     steps:
       - name: Check out code into the Go module directory
@@ -29,24 +35,18 @@ jobs:
       - name: Build
         env:
           CGO_ENABLED: 0
-          GOOS: ${{ matrix.go-os }}
+          GOOS: linux
           GOARCH: ${{ matrix.go-arch }}
-        run: |
-          #arm binaries target GOARM=6 explicitly: they run on v6 AND v7
-          #hardware (Go's implicit default for GOARCH=arm is v7)
-          if [ "$GOARCH" = "arm" ]; then
-            export GOARM=6
-          fi
-          BINARY=mqtt-executor-${{ matrix.go-os }}-${{ matrix.go-arch }}
-          if [ "$GOOS" = "windows" ]; then
-            BINARY=$BINARY.exe
-          fi
-          go build -o "$BINARY" ./cmd/mqtt-executor/
+          GOARM: ${{ matrix.go-arm }}
+          BINARY: mqtt-executor-${{ matrix.target }}
+          VERSION: ${{ github.ref_name }}
+        run: go build -ldflags "-X main.versionTag=$VERSION" -o "$BINARY" ./cmd/mqtt-executor/
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mqtt-executor-${{ matrix.go-os }}-${{ matrix.go-arch }}
-          path: mqtt-executor-*
+          name: mqtt-executor-${{ matrix.target }}
+          path: mqtt-executor-${{ matrix.target }}
+          if-no-files-found: error
 
   release:
     name: Create Github Release
@@ -89,6 +89,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: latest=auto
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -96,7 +97,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
