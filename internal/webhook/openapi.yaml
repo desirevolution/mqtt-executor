@@ -1,0 +1,187 @@
+openapi: 3.0.3
+info:
+  title: mqtt-executor webhook API
+  description: |
+    Synchronous HTTP ingress next to MQTT: start/interrupt trigger commands
+    and query sensor commands on demand. Results are returned in the HTTP
+    response; MQTT side effects (STATE, RESULT, sensor publishes) stay shared
+    with the MQTT ingress when a broker is configured.
+
+    Note: a trigger timeout (config `timeout`) and an intentional stop both
+    return HTTP 200 with result `<INTERRUPTED>`. A command that exits
+    non-zero returns HTTP 500 with result `<FAILED>;...`.
+  version: 1.0.0
+paths:
+  /trigger/{name}:
+    post:
+      summary: Start a trigger and wait for its completion
+      description: |
+        Executes the trigger's command and waits for it to finish. The raw
+        request body is passed to the command as stdin when the trigger is
+        configured with `stdin_payload: true`.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Trigger name from the configuration
+          schema:
+            type: string
+      requestBody:
+        required: false
+        description: |
+          Payload (passed to the command as stdin if configured). Limited to
+          1 MiB — larger bodies are rejected with 400.
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Command finished (or was intentionally interrupted)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TriggerResponse'
+        '400':
+          description: Request body too large (limit 1 MiB) or unreadable
+          content:
+            text/plain:
+              schema:
+                type: string
+        '404':
+          description: Unknown trigger
+          content:
+            text/plain:
+              schema:
+                type: string
+        '409':
+          description: Command already running (state RUNNING, empty result)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TriggerResponse'
+        '500':
+          description: Command execution failed (result starts with `<FAILED>;`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TriggerResponse'
+    delete:
+      summary: Interrupt a running command of this trigger (idempotent)
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Trigger exists (state STOPPED — also when nothing was running)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TriggerResponse'
+        '404':
+          description: Unknown trigger
+          content:
+            text/plain:
+              schema:
+                type: string
+  /trigger/{name}/stop:
+    post:
+      summary: Alias for DELETE /trigger/{name}
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Trigger exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TriggerResponse'
+        '404':
+          description: Unknown trigger
+          content:
+            text/plain:
+              schema:
+                type: string
+  /sensor/{name}:
+    get:
+      summary: Run a sensor command on demand
+      description: |
+        Executes the sensor's command synchronously and returns the output.
+        The result is also published to MQTT (when a broker is configured),
+        independently of any `publish_on_change` setting.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Sensor name (single sensors) or multi sensor value name
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Command output (plain text, trimmed)
+          content:
+            text/plain:
+              schema:
+                type: string
+        '404':
+          description: Unknown sensor
+          content:
+            text/plain:
+              schema:
+                type: string
+        '500':
+          description: Command execution failed (body starts with `<FAILED>;`)
+          content:
+            text/plain:
+              schema:
+                type: string
+  /status:
+    get:
+      summary: Health/readiness probe
+      responses:
+        '200':
+          description: Server is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  uptime:
+                    type: string
+                    example: 1h2m3s
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      description: Command runs, errors and durations per entity (type, name).
+      responses:
+        '200':
+          description: Prometheus exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+components:
+  schemas:
+    TriggerResponse:
+      type: object
+      properties:
+        state:
+          type: string
+          enum: [STOPPED, RUNNING]
+          description: Final state of the trigger (RUNNING only for 409 responses)
+        result:
+          type: string
+          description: |
+            Command output (stdout+stderr, trimmed), `<INTERRUPTED>` after a
+            stop/timeout, `<FAILED>;<error>` on execution failure.

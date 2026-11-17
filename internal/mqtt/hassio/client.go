@@ -3,13 +3,14 @@ package hassio
 import (
 	"encoding/json"
 	"fmt"
-	MQTT "github.com/eclipse/paho.mqtt.golang"
-	"github.com/rainu/mqtt-executor/internal/mqtt"
-	"github.com/rainu/mqtt-executor/internal/mqtt/config"
-	"go.uber.org/zap"
+	"log/slog"
 	"runtime"
 	"runtime/debug"
 	"strings"
+
+	"github.com/rainu/mqtt-executor/internal/mqtt"
+	"github.com/rainu/mqtt-executor/internal/mqtt/config"
+	"github.com/rainu/mqtt-executor/internal/transport"
 )
 
 type generalConfig struct {
@@ -60,55 +61,86 @@ type Client struct {
 	DeviceName  string
 	DeviceId    string
 	TopicPrefix string
-	MqttClient  MQTT.Client
+	Publisher   transport.Publisher
 }
 
-func (c *Client) PublishDiscoveryConfig(config config.TopicConfigurations) {
-	zap.L().Info("Initialise homeassistant config.")
+func (c *Client) PublishDiscoveryConfig(config config.TopicConfigurations) error {
+	slog.Info("Initialise homeassistant config.")
 
 	//status
 	if config.Availability != nil {
 		targetTopic := fmt.Sprintf("%ssensor/%s_status/config", c.TopicPrefix, c.DeviceId)
-		payload := c.generatePayloadForStatus(config.Availability)
-		c.MqttClient.Publish(targetTopic, byte(1), false, payload)
+		payload, err := c.generatePayloadForStatus(config.Availability)
+		if err != nil {
+			return fmt.Errorf("discovery config for %q: %w", targetTopic, err)
+		}
+		if err := c.Publisher.Publish(targetTopic, byte(1), false, payload); err != nil {
+			return fmt.Errorf("publish discovery config %q: %w", targetTopic, err)
+		}
 	}
 
 	//sensor
 	for _, sensor := range config.Sensor {
 		targetTopic := fmt.Sprintf("%ssensor/%s_%s/config", c.TopicPrefix, c.DeviceId, friendlyName(sensor.Name))
-		payload := c.generatePayloadForSensor(config.Availability, sensor)
-		c.MqttClient.Publish(targetTopic, byte(1), false, payload)
+		payload, err := c.generatePayloadForSensor(config.Availability, sensor)
+		if err != nil {
+			return fmt.Errorf("discovery config for %q: %w", targetTopic, err)
+		}
+		if err := c.Publisher.Publish(targetTopic, byte(1), false, payload); err != nil {
+			return fmt.Errorf("publish discovery config %q: %w", targetTopic, err)
+		}
 	}
 
 	//multi sensor
 	for _, sensor := range config.MultiSensor {
 		for _, sensorValue := range sensor.Values {
 			targetTopic := fmt.Sprintf("%ssensor/%s_%s/config", c.TopicPrefix, c.DeviceId, friendlyName(sensorValue.Name))
-			payload := c.generatePayloadForMultiSensor(config.Availability, sensor, sensorValue)
-			c.MqttClient.Publish(targetTopic, byte(1), false, payload)
+			payload, err := c.generatePayloadForMultiSensor(config.Availability, sensor, sensorValue)
+			if err != nil {
+				return fmt.Errorf("discovery config for %q: %w", targetTopic, err)
+			}
+			if err := c.Publisher.Publish(targetTopic, byte(1), false, payload); err != nil {
+				return fmt.Errorf("publish discovery config %q: %w", targetTopic, err)
+			}
 		}
 	}
 
 	//trigger
 	for _, trigger := range config.Trigger {
 		targetTopic := fmt.Sprintf("%sswitch/%s/%s/config", c.TopicPrefix, c.DeviceId, friendlyName(trigger.Name))
-		payload := c.generateSwitchPayloadForTriggerAction(config.Availability, trigger)
-		c.MqttClient.Publish(targetTopic, byte(1), false, payload)
+		payload, err := c.generateSwitchPayloadForTriggerAction(config.Availability, trigger)
+		if err != nil {
+			return fmt.Errorf("discovery config for %q: %w", targetTopic, err)
+		}
+		if err := c.Publisher.Publish(targetTopic, byte(1), false, payload); err != nil {
+			return fmt.Errorf("publish discovery config %q: %w", targetTopic, err)
+		}
 
 		//publish the trigger-result as sensor data
 		targetTopic = fmt.Sprintf("%ssensor/%s_%s/result/config", c.TopicPrefix, c.DeviceId, friendlyName(trigger.Name))
-		payload = c.generateResultPayloadForTriggerAction(config.Availability, trigger)
-		c.MqttClient.Publish(targetTopic, byte(1), false, payload)
+		payload, err = c.generateResultPayloadForTriggerAction(config.Availability, trigger)
+		if err != nil {
+			return fmt.Errorf("discovery config for %q: %w", targetTopic, err)
+		}
+		if err := c.Publisher.Publish(targetTopic, byte(1), false, payload); err != nil {
+			return fmt.Errorf("publish discovery config %q: %w", targetTopic, err)
+		}
 
 		//publish the trigger-state as sensor data
 		targetTopic = fmt.Sprintf("%ssensor/%s_%s/state/config", c.TopicPrefix, c.DeviceId, friendlyName(trigger.Name))
-		payload = c.generateStatePayloadForTriggerAction(config.Availability, trigger)
-		c.MqttClient.Publish(targetTopic, byte(1), false, payload)
+		payload, err = c.generateStatePayloadForTriggerAction(config.Availability, trigger)
+		if err != nil {
+			return fmt.Errorf("discovery config for %q: %w", targetTopic, err)
+		}
+		if err := c.Publisher.Publish(targetTopic, byte(1), false, payload); err != nil {
+			return fmt.Errorf("publish discovery config %q: %w", targetTopic, err)
+		}
 	}
+	return nil
 }
 
 func friendlyName(name string) string {
-	return strings.Replace(name, " ", "_", -1)
+	return strings.ReplaceAll(name, " ", "_")
 }
 
 func (c *Client) buildDevice() device {
@@ -121,7 +153,7 @@ func (c *Client) buildDevice() device {
 	}
 }
 
-func (c *Client) generatePayloadForStatus(availability *config.Availability) []byte {
+func (c *Client) generatePayloadForStatus(availability *config.Availability) ([]byte, error) {
 	conf := sensorConfig{
 		generalConfig: generalConfig{
 			Name:                "Status",
@@ -137,15 +169,10 @@ func (c *Client) generatePayloadForStatus(availability *config.Availability) []b
 		conf.Device.Version += " " + info.Main.Version
 	}
 
-	payload, err := json.Marshal(conf)
-	if err != nil {
-		//the "marshalling" is relatively safe - it should never appear at runtime
-		panic(err)
-	}
-	return payload
+	return json.Marshal(conf)
 }
 
-func (c *Client) generatePayloadForSensor(availability *config.Availability, sensor config.Sensor) []byte {
+func (c *Client) generatePayloadForSensor(availability *config.Availability, sensor config.Sensor) ([]byte, error) {
 	bTrue := true
 	conf := sensorConfig{
 		generalConfig: generalConfig{
@@ -160,15 +187,10 @@ func (c *Client) generatePayloadForSensor(availability *config.Availability, sen
 	}
 	addAvailability(&conf.generalConfig, availability)
 
-	payload, err := json.Marshal(conf)
-	if err != nil {
-		//the "marshalling" is relatively safe - it should never appear at runtime
-		panic(err)
-	}
-	return payload
+	return json.Marshal(conf)
 }
 
-func (c *Client) generatePayloadForMultiSensor(availability *config.Availability, sensor config.MultiSensor, sensorValue config.MultiSensorValue) []byte {
+func (c *Client) generatePayloadForMultiSensor(availability *config.Availability, sensor config.MultiSensor, sensorValue config.MultiSensorValue) ([]byte, error) {
 	bTrue := true
 	conf := sensorConfig{
 		generalConfig: generalConfig{
@@ -184,15 +206,10 @@ func (c *Client) generatePayloadForMultiSensor(availability *config.Availability
 	}
 	addAvailability(&conf.generalConfig, availability)
 
-	payload, err := json.Marshal(conf)
-	if err != nil {
-		//the "marshalling" is relatively safe - it should never appear at runtime
-		panic(err)
-	}
-	return payload
+	return json.Marshal(conf)
 }
 
-func (c *Client) generateSwitchPayloadForTriggerAction(availability *config.Availability, trigger config.Trigger) []byte {
+func (c *Client) generateSwitchPayloadForTriggerAction(availability *config.Availability, trigger config.Trigger) ([]byte, error) {
 	conf := triggerConfig{
 		generalConfig: generalConfig{
 			Name:     fmt.Sprintf("%s", trigger.Name),
@@ -209,15 +226,10 @@ func (c *Client) generateSwitchPayloadForTriggerAction(availability *config.Avai
 	}
 	addAvailability(&conf.generalConfig, availability)
 
-	payload, err := json.Marshal(conf)
-	if err != nil {
-		//the "marshalling" is relatively safe - it should never appear at runtime
-		panic(err)
-	}
-	return payload
+	return json.Marshal(conf)
 }
 
-func (c *Client) generateResultPayloadForTriggerAction(availability *config.Availability, trigger config.Trigger) []byte {
+func (c *Client) generateResultPayloadForTriggerAction(availability *config.Availability, trigger config.Trigger) ([]byte, error) {
 	conf := sensorConfig{
 		generalConfig: generalConfig{
 			Name:     fmt.Sprintf("%s - Result", trigger.Name),
@@ -229,15 +241,10 @@ func (c *Client) generateResultPayloadForTriggerAction(availability *config.Avai
 	}
 	addAvailability(&conf.generalConfig, availability)
 
-	payload, err := json.Marshal(conf)
-	if err != nil {
-		//the "marshalling" is relatively safe - it should never appear at runtime
-		panic(err)
-	}
-	return payload
+	return json.Marshal(conf)
 }
 
-func (c *Client) generateStatePayloadForTriggerAction(availability *config.Availability, trigger config.Trigger) []byte {
+func (c *Client) generateStatePayloadForTriggerAction(availability *config.Availability, trigger config.Trigger) ([]byte, error) {
 	conf := sensorConfig{
 		generalConfig: generalConfig{
 			Name:     fmt.Sprintf("%s - State", trigger.Name),
@@ -249,12 +256,7 @@ func (c *Client) generateStatePayloadForTriggerAction(availability *config.Avail
 	}
 	addAvailability(&conf.generalConfig, availability)
 
-	payload, err := json.Marshal(conf)
-	if err != nil {
-		//the "marshalling" is relatively safe - it should never appear at runtime
-		panic(err)
-	}
-	return payload
+	return json.Marshal(conf)
 }
 
 func addAvailability(config *generalConfig, availability *config.Availability) {

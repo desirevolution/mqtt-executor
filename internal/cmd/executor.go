@@ -3,7 +3,8 @@ package cmd
 import (
 	"context"
 	"errors"
-	"go.uber.org/zap"
+	"io"
+	"log/slog"
 	"os/exec"
 	"strings"
 	"sync"
@@ -24,10 +25,16 @@ func NewCommandExecutor() *CommandExecutor {
 }
 
 func (c *CommandExecutor) ExecuteCommand(cmd string, args []string) ([]byte, error) {
-	return c.ExecuteCommandWithContext(cmd, args, context.Background())
+	return c.ExecuteCommandWithStdin(cmd, args, context.Background(), nil)
 }
 
 func (c *CommandExecutor) ExecuteCommandWithContext(cmd string, args []string, executionContext context.Context) ([]byte, error) {
+	return c.ExecuteCommandWithStdin(cmd, args, executionContext, nil)
+}
+
+// ExecuteCommandWithStdin runs the command; if stdin is not nil its content
+// is piped into the command's standard input.
+func (c *CommandExecutor) ExecuteCommandWithStdin(cmd string, args []string, executionContext context.Context, stdin io.Reader) ([]byte, error) {
 	//register the context so that we have a chance to cancel the commands later
 	ctx := c.registerContext(executionContext)
 	c.openExecutions.Add(1)
@@ -35,6 +42,13 @@ func (c *CommandExecutor) ExecuteCommandWithContext(cmd string, args []string, e
 	defer c.releaseContext(ctx)
 
 	command := exec.CommandContext(ctx, cmd, args...)
+	configureProcess(command)
+	//safety net: if cancellation cannot close the I/O pipes (e.g. a detached
+	//grandchild escaped the process group), do not wait forever
+	command.WaitDelay = 2 * time.Second
+	if stdin != nil {
+		command.Stdin = stdin
+	}
 	out, execErr := command.CombinedOutput()
 
 	if len(out) > 0 {
@@ -43,9 +57,9 @@ func (c *CommandExecutor) ExecuteCommandWithContext(cmd string, args []string, e
 	}
 
 	if execErr != nil && ctx.Err() == nil {
-		zap.L().Error("Command execution failed.", zap.Error(execErr))
+		slog.Error("Command execution failed.", "error", execErr)
 	} else if ctx.Err() != nil {
-		zap.L().Info("Command execution cancelled.")
+		slog.Info("Command execution cancelled.")
 		return out, ctx.Err()
 	}
 
@@ -95,17 +109,17 @@ func (c *CommandExecutor) Close(timeout time.Duration) error {
 	}
 
 	//wait for all commands to be stopped
-	wgChan := make(chan bool)
+	done := make(chan struct{})
 	go func() {
 		wg.Wait()
 		c.openExecutions.Wait()
 
-		wgChan <- true
+		close(done)
 	}()
 
 	//wait for WaitGroup or Timeout
 	select {
-	case <-wgChan:
+	case <-done:
 		return nil
 	case <-time.After(timeout):
 		return errors.New("timeout exceeded")

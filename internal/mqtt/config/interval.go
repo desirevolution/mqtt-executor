@@ -2,14 +2,21 @@ package config
 
 import (
 	"fmt"
-	"strings"
 	"time"
+
+	"go.yaml.in/yaml/v3"
 )
 
 type Interval time.Duration
 
-func (i *Interval) UnmarshalJSON(b []byte) error {
-	duration, err := time.ParseDuration(strings.Replace(string(b), `"`, "", -1))
+// UnmarshalYAML accepts a duration string like "10s", quoted or unquoted.
+func (i *Interval) UnmarshalYAML(value *yaml.Node) error {
+	var s string
+	if err := value.Decode(&s); err != nil {
+		return fmt.Errorf("invalid interval: %w", err)
+	}
+
+	duration, err := time.ParseDuration(s)
 	if err != nil {
 		return fmt.Errorf("invalid interval: %w", err)
 	}

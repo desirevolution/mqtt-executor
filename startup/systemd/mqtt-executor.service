@@ -5,7 +5,7 @@ After=network.target
 [Service]
 User=<user>
 Type=simple
-ExecStart=/path/to/mqtt-executor -broker tcp://<mqtt-broker>:1883 -config /path/to/config.json
+ExecStart=/path/to/mqtt-executor -broker tcp://<mqtt-broker>:1883 -config /path/to/config.yaml
 StartLimitBurst=60
 StartLimitIntervalSec=3
 Restart=on-failure

@@ -1,0 +1,11 @@
+.git
+.github
+.scratch
+test
+scripts
+startup
+Dockerfile
+.dockerignore
+mqtt-executor-*
+config.yaml
+config.json

@@ -1,69 +1,90 @@
 package config
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
+	"runtime"
+	"sort"
 	"strings"
 	"time"
+
+	"go.yaml.in/yaml/v3"
 )
 
 type TopicConfigurations struct {
-	Availability *Availability `json:"availability,omitempty"`
-	Trigger      []Trigger     `json:"trigger"`
-	Sensor       []Sensor      `json:"sensor"`
-	MultiSensor  []MultiSensor `json:"multi_sensor"`
+	Availability *Availability `yaml:"availability,omitempty"`
+	Trigger      []Trigger     `yaml:"trigger"`
+	Sensor       []Sensor      `yaml:"sensor"`
+	MultiSensor  []MultiSensor `yaml:"multi_sensor"`
 }
 
 type Availability struct {
-	Topic   string              `json:"topic"`
-	Payload availabilityPayload `json:"payload"`
+	Topic   string              `yaml:"topic"`
+	Payload availabilityPayload `yaml:"payload"`
 }
 type availabilityPayload struct {
-	Available   string `json:"available"`
-	Unavailable string `json:"unavailable"`
+	Available   string `yaml:"available"`
+	Unavailable string `yaml:"unavailable"`
 }
 
 type Trigger struct {
-	Name    string  `json:"name"`
-	Topic   string  `json:"topic"`
-	Icon    string  `json:"icon"`
-	Command Command `json:"command"`
+	Name    string  `yaml:"name"`
+	Topic   string  `yaml:"topic"`
+	Icon    string  `yaml:"icon"`
+	Command Command `yaml:"command"`
+	// StdinPayload: pass the incoming payload (MQTT message body / webhook
+	// request body) to the command as stdin
+	StdinPayload bool `yaml:"stdin_payload"`
+	// Timeout: interrupt the command after this duration (optional, default:
+	// run until completion)
+	Timeout Interval `yaml:"timeout"`
 }
 
 type GeneralSensor struct {
-	ResultTopic string   `json:"topic"`
-	Retained    bool     `json:"retained"`
-	Interval    Interval `json:"interval"`
-	Command     Command  `json:"command"`
+	ResultTopic string   `yaml:"topic"`
+	Retained    bool     `yaml:"retained"`
+	Interval    Interval `yaml:"interval"`
+	Command     Command  `yaml:"command"`
+	// Timeout: interrupt the command after this duration (optional, default:
+	// run until completion)
+	Timeout Interval `yaml:"timeout"`
+	// PublishOnChange: skip publishing the result when the output equals the
+	// previous run's output (optional, default: always publish)
+	PublishOnChange bool `yaml:"publish_on_change"`
+	// Name identifies the sensor for metrics/logs; not part of the YAML
+	// config (populated by LoadTopicConfiguration)
+	Name string `yaml:"-"`
 }
 
 type Sensor struct {
-	GeneralSensor
+	//explicit inline tag: yaml's KnownFields(true) (strict parsing) does not
+	//recurse into untagged embedded structs
+	GeneralSensor `yaml:",inline"`
 
-	Name string `json:"name"`
-	Unit string `json:"unit"`
-	Icon string `json:"icon"`
+	Name string `yaml:"name"`
+	Unit string `yaml:"unit"`
+	Icon string `yaml:"icon"`
 }
 
 type MultiSensor struct {
-	GeneralSensor
+	GeneralSensor `yaml:",inline"`
 
-	Values []MultiSensorValue `json:"values"`
+	Values []MultiSensorValue `yaml:"values"`
 }
 
 type MultiSensorValue struct {
-	Name     string `json:"name"`
-	Template string `json:"template"`
-	Unit     string `json:"unit"`
-	Icon     string `json:"icon"`
+	Name     string `yaml:"name"`
+	Template string `yaml:"template"`
+	Unit     string `yaml:"unit"`
+	Icon     string `yaml:"icon"`
 }
 
 type Command struct {
-	Name      string   `json:"name"`
-	Arguments []string `json:"arguments"`
+	Name      string   `yaml:"name"`
+	Arguments []string `yaml:"arguments"`
 }
 
 func LoadTopicConfiguration(configFilePath, deviceId string) (TopicConfigurations, error) {
@@ -74,7 +95,11 @@ func LoadTopicConfiguration(configFilePath, deviceId string) (TopicConfiguration
 	defer configFile.Close()
 
 	var topicConfig TopicConfigurations
-	err = json.NewDecoder(configFile).Decode(&topicConfig)
+	//strict parsing: unknown keys cause an error instead of being silently
+	//ignored (catches typos in the config file)
+	decoder := yaml.NewDecoder(configFile)
+	decoder.KnownFields(true)
+	err = decoder.Decode(&topicConfig)
 	if err != nil {
 		return TopicConfigurations{}, fmt.Errorf("could not read topic configuration file: %w", err)
 	}
@@ -86,7 +111,7 @@ func LoadTopicConfiguration(configFilePath, deviceId string) (TopicConfiguration
 
 	//replace DEVICE_ID
 	if topicConfig.Availability != nil {
-		topicConfig.Availability.Topic = strings.Replace(topicConfig.Availability.Topic, "__DEVICE_ID__", deviceId, -1)
+		topicConfig.Availability.Topic = strings.ReplaceAll(topicConfig.Availability.Topic, "__DEVICE_ID__", deviceId)
 		if topicConfig.Availability.Payload.Available == "" {
 			topicConfig.Availability.Payload.Available = "Online"
 		}
@@ -95,13 +120,24 @@ func LoadTopicConfiguration(configFilePath, deviceId string) (TopicConfiguration
 		}
 	}
 	for i := range topicConfig.Trigger {
-		topicConfig.Trigger[i].Topic = strings.Replace(topicConfig.Trigger[i].Topic, "__DEVICE_ID__", deviceId, -1)
+		topicConfig.Trigger[i].Topic = strings.ReplaceAll(topicConfig.Trigger[i].Topic, "__DEVICE_ID__", deviceId)
 	}
 	for i := range topicConfig.Sensor {
-		topicConfig.Sensor[i].ResultTopic = strings.Replace(topicConfig.Sensor[i].ResultTopic, "__DEVICE_ID__", deviceId, -1)
+		topicConfig.Sensor[i].ResultTopic = strings.ReplaceAll(topicConfig.Sensor[i].ResultTopic, "__DEVICE_ID__", deviceId)
 	}
 	for i := range topicConfig.MultiSensor {
-		topicConfig.MultiSensor[i].ResultTopic = strings.Replace(topicConfig.MultiSensor[i].ResultTopic, "__DEVICE_ID__", deviceId, -1)
+		topicConfig.MultiSensor[i].ResultTopic = strings.ReplaceAll(topicConfig.MultiSensor[i].ResultTopic, "__DEVICE_ID__", deviceId)
+	}
+
+	//populate entity names for metrics/logs: single sensors use their own
+	//name, multi sensors (which have no config name) use their first value
+	for i := range topicConfig.Sensor {
+		topicConfig.Sensor[i].GeneralSensor.Name = topicConfig.Sensor[i].Name
+	}
+	for i := range topicConfig.MultiSensor {
+		if len(topicConfig.MultiSensor[i].Values) > 0 {
+			topicConfig.MultiSensor[i].GeneralSensor.Name = topicConfig.MultiSensor[i].Values[0].Name
+		}
 	}
 
 	return topicConfig, nil
@@ -172,6 +208,9 @@ func validateSensor(sensor Sensor) error {
 	if time.Duration(sensor.Interval).Nanoseconds() == 0 {
 		return errors.New("invalid duration")
 	}
+	if err := validateTimeout(sensor.Timeout); err != nil {
+		return err
+	}
 	if err := checkTopicName(sensor.ResultTopic); err != nil {
 		return fmt.Errorf("invalid topic: %w", err)
 	}
@@ -182,6 +221,9 @@ func validateSensor(sensor Sensor) error {
 }
 
 func validateMultiSensor(sensor MultiSensor) error {
+	if len(sensor.Values) == 0 {
+		return errors.New("values must not be empty")
+	}
 	for _, multiSensorValue := range sensor.Values {
 		if multiSensorValue.Name == "" {
 			return errors.New("name must not be empty")
@@ -192,6 +234,9 @@ func validateMultiSensor(sensor MultiSensor) error {
 	}
 	if time.Duration(sensor.Interval).Nanoseconds() == 0 {
 		return errors.New("invalid duration")
+	}
+	if err := validateTimeout(sensor.Timeout); err != nil {
+		return err
 	}
 	if err := checkTopicName(sensor.ResultTopic); err != nil {
 		return fmt.Errorf("invalid topic: %w", err)
@@ -209,8 +254,19 @@ func validateTrigger(trigger Trigger) error {
 	if err := checkTopicName(trigger.Topic); err != nil {
 		return fmt.Errorf("invalid topic: %w", err)
 	}
+	if err := validateTimeout(trigger.Timeout); err != nil {
+		return err
+	}
 	if trigger.Command.Name == "" {
 		return errors.New("command name must not be empty")
+	}
+	return nil
+}
+
+// validateTimeout rejects negative timeouts; zero means "no timeout".
+func validateTimeout(timeout Interval) error {
+	if timeout < 0 {
+		return errors.New("timeout must not be negative")
 	}
 	return nil
 }
@@ -225,5 +281,61 @@ func checkTopicName(topic string) error {
 		return errors.New("invalid character")
 	}
 
+	return nil
+}
+
+// ValidateCommands checks that every configured command exists and is
+// executable (fail fast at startup instead of failing at every run).
+func (t *TopicConfigurations) ValidateCommands() error {
+	commands := map[string]bool{}
+	collect := func(command Command) {
+		if command.Name != "" {
+			commands[command.Name] = true
+		}
+	}
+	for _, trigger := range t.Trigger {
+		collect(trigger.Command)
+	}
+	for _, sensor := range t.Sensor {
+		collect(sensor.Command)
+	}
+	for _, sensor := range t.MultiSensor {
+		collect(sensor.Command)
+	}
+
+	//deterministic error order (map iteration order is random)
+	names := make([]string, 0, len(commands))
+	for name := range commands {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		if err := checkCommand(name); err != nil {
+			return fmt.Errorf("command %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func checkCommand(name string) error {
+	if strings.ContainsRune(name, os.PathSeparator) {
+		//absolute or relative path: must exist (and be executable on unix)
+		info, err := os.Stat(name)
+		if err != nil {
+			return fmt.Errorf("not found: %w", err)
+		}
+		if info.IsDir() {
+			return errors.New("is a directory")
+		}
+		if runtime.GOOS != "windows" && info.Mode()&0o111 == 0 {
+			return errors.New("is not executable")
+		}
+		return nil
+	}
+
+	if _, err := exec.LookPath(name); err != nil {
+		return fmt.Errorf("not found in PATH: %w", err)
+	}
 	return nil
 }

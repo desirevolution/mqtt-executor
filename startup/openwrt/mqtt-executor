@@ -6,7 +6,7 @@ START=99
 STOP=15
 
 start() {
-    /path/to/mqtt-executor -broker tcp://<mqtt-broker>:1883 -config /path/to/config.json
+    /path/to/mqtt-executor -broker tcp://<mqtt-broker>:1883 -config /path/to/config.yaml
 }
 
 stop() {

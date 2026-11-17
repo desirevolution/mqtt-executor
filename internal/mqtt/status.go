@@ -3,17 +3,19 @@ package mqtt
 import (
 	"context"
 	"errors"
-	MQTT "github.com/eclipse/paho.mqtt.golang"
-	"github.com/rainu/mqtt-executor/internal/mqtt/config"
+	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/rainu/mqtt-executor/internal/mqtt/config"
+	"github.com/rainu/mqtt-executor/internal/transport"
 )
 
 type StatusWorker struct {
 	waitGroup  sync.WaitGroup
 	cancelFunc context.CancelFunc
 
-	MqttClient MQTT.Client
+	Publisher transport.Publisher
 }
 
 func (s *StatusWorker) Initialise(availabilityConfigs config.Availability) {
@@ -29,13 +31,16 @@ func (s *StatusWorker) Initialise(availabilityConfigs config.Availability) {
 func (s *StatusWorker) runStatus(ctx context.Context, availabilityConfig config.Availability) {
 	defer s.waitGroup.Done()
 	defer func() {
-		token := s.MqttClient.Publish(availabilityConfig.Topic, byte(1), true, availabilityConfig.Payload.Unavailable)
-
-		//we should wait for the last state publish (graceful shutdown dont trigger the mqtt-last-will!)
-		token.Wait()
+		//we should publish the last state (graceful shutdown should not trigger the mqtt-last-will!)
+		//the MQTTPublisher waits for the token internally
+		if err := s.Publisher.Publish(availabilityConfig.Topic, byte(1), true, availabilityConfig.Payload.Unavailable); err != nil {
+			slog.Error("Failed to publish unavailable state", "topic", availabilityConfig.Topic, "error", err)
+		}
 	}()
 
-	s.MqttClient.Publish(availabilityConfig.Topic, byte(1), true, availabilityConfig.Payload.Available)
+	if err := s.Publisher.Publish(availabilityConfig.Topic, byte(1), true, availabilityConfig.Payload.Available); err != nil {
+		slog.Error("Failed to publish available state", "topic", availabilityConfig.Topic, "error", err)
+	}
 
 	//wait until shutdown
 	<-ctx.Done()
@@ -47,15 +52,15 @@ func (s *StatusWorker) Close(timeout time.Duration) error {
 		s.cancelFunc()
 	}
 
-	wgChan := make(chan bool)
+	done := make(chan struct{})
 	go func() {
 		s.waitGroup.Wait()
-		wgChan <- true
+		close(done)
 	}()
 
 	//wait for WaitGroup or Timeout
 	select {
-	case <-wgChan:
+	case <-done:
 		return nil
 	case <-time.After(timeout):
 		return errors.New("timeout exceeded")

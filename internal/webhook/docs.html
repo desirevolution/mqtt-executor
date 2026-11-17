@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mqtt-executor — API playground</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.05rem; margin-top: 2rem; }
+  .method { display: inline-block; font-weight: bold; padding: 2px 8px; border-radius: 4px; color: #fff; margin-right: 4px; }
+  .post { background: #49cc90; } .get { background: #61affe; } .delete { background: #f93e3e; }
+  fieldset { border: 1px solid #ddd; border-radius: 6px; margin: 0 0 1rem; }
+  input, textarea, button { font: inherit; padding: 4px 8px; margin: 4px 0; }
+  input[type=text] { width: 14em; } textarea { width: 98%; min-height: 4em; display: block; }
+  button { cursor: pointer; }
+  pre { background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px; padding: 8px; white-space: pre-wrap; word-break: break-word; max-height: 20em; overflow: auto; }
+  code { background: #f5f5f5; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>mqtt-executor — API playground</h1>
+<p>Synchronous HTTP ingress next to MQTT. <a href="/openapi.yaml">OpenAPI spec</a>.
+MQTT side effects (STATE/RESULT, sensor publishes) apply when a broker is configured.</p>
+
+<h2><span class="method post">POST</span> /trigger/{name}</h2>
+<p>Starts the command and waits for its completion. The body is passed to the
+command as stdin when the trigger is configured with <code>stdin_payload: true</code>.</p>
+<fieldset>
+  <input type="text" id="trigger-name" placeholder="trigger name">
+  <textarea id="trigger-body" placeholder="payload (optional; → stdin if configured)"></textarea>
+  <button onclick="startTrigger()">Start</button>
+  <pre id="trigger-out" hidden></pre>
+</fieldset>
+
+<h2><span class="method delete">DELETE</span> /trigger/{name}</h2>
+<p>Interrupts a running command (idempotent). Alias: <code>POST /trigger/{name}/stop</code>.</p>
+<fieldset>
+  <input type="text" id="stop-name" placeholder="trigger name">
+  <button onclick="stopTrigger()">Stop</button>
+  <pre id="stop-out" hidden></pre>
+</fieldset>
+
+<h2><span class="method get">GET</span> /sensor/{name}</h2>
+<p>Runs the sensor's command on demand and returns the output.</p>
+<fieldset>
+  <input type="text" id="sensor-name" placeholder="sensor name">
+  <button onclick="querySensor()">Query</button>
+  <pre id="sensor-out" hidden></pre>
+</fieldset>
+
+<h2><span class="method get">GET</span> /status</h2>
+<fieldset><button onclick="get('/status','status-out')">Call</button><pre id="status-out" hidden></pre></fieldset>
+
+<h2><span class="method get">GET</span> /metrics</h2>
+<fieldset><button onclick="get('/metrics','metrics-out')">Call</button><pre id="metrics-out" hidden></pre></fieldset>
+
+<script>
+async function call(method, path, body, outId) {
+  const out = document.getElementById(outId);
+  out.hidden = false;
+  out.textContent = '…';
+  try {
+    const resp = await fetch(path, {method: method, body: body || undefined});
+    const text = await resp.text();
+    out.textContent = 'HTTP ' + resp.status + '\n' + (text || '(empty body)');
+  } catch (err) {
+    out.textContent = 'request failed: ' + err;
+  }
+}
+const startTrigger = () => call('POST', '/trigger/' + encodeURIComponent(document.getElementById('trigger-name').value), document.getElementById('trigger-body').value, 'trigger-out');
+const stopTrigger = () => call('DELETE', '/trigger/' + encodeURIComponent(document.getElementById('stop-name').value), null, 'stop-out');
+const querySensor = () => call('GET', '/sensor/' + encodeURIComponent(document.getElementById('sensor-name').value), null, 'sensor-out');
+const get = (path, outId) => call('GET', path, null, outId);
+</script>
+</body>
+</html>
