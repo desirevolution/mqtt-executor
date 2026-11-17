@@ -394,3 +394,70 @@ func TestRunTopicUsesConfiguredFeedbackTopicAndIgnoresRetained(t *testing.T) {
 	assert.Equal(t, 0, pub.count("cmnd/test/RESULT", "replayed"))
 	assert.Equal(t, 0, pub.countTopic("cmnd/test/run/RESULT"))
 }
+
+type stalledRunningPublisher struct {
+	fakePublisher
+	waiting chan struct{}
+	release chan struct{}
+}
+
+func (p *stalledRunningPublisher) Publish(topic string, qos byte, retained bool, payload any) error {
+	if state, ok := payload.(string); ok && state == PayloadStatusRunning {
+		close(p.waiting)
+		<-p.release
+	}
+	return p.fakePublisher.Publish(topic, qos, retained, payload)
+}
+
+func TestTriggerRunsWhileMQTTFeedbackIsStalled(t *testing.T) {
+	broker := &stalledRunningPublisher{waiting: make(chan struct{}), release: make(chan struct{})}
+	publisher := transport.NewBufferedPublisher(broker, func() bool { return true }, 16)
+	t.Cleanup(func() {
+		close(broker.release)
+		assert.NoError(t, publisher.Close(time.Second))
+		broker.mu.Lock()
+		defer broker.mu.Unlock()
+		require.Equal(t, []fakePublication{
+			{topic: "cmnd/one/STATE", payload: PayloadStatusStopped},
+			{topic: "cmnd/one/STATE", payload: PayloadStatusRunning},
+			{topic: "cmnd/one/RESULT", payload: "first"},
+			{topic: "cmnd/one/STATE", payload: PayloadStatusStopped},
+		}, broker.published)
+	})
+
+	tr := newTestTrigger(publisher)
+	tr.Initialise(1, 1, []config.Trigger{
+		{Name: "Both", Topic: "cmnd/one", WebhookID: "one", Command: config.Command{Name: "/bin/echo", Arguments: []string{"first"}}},
+		{Name: "HTTP only", WebhookID: "two", Command: config.Command{Name: "/bin/echo", Arguments: []string{"second"}}},
+	})
+	outcome := func(id string) <-chan string {
+		done := make(chan string, 1)
+		go func() {
+			_, output, err := tr.StartSync(id, nil)
+			if err != nil {
+				done <- err.Error()
+				return
+			}
+			done <- output
+		}()
+		return done
+	}
+	first := outcome("one")
+	select {
+	case <-broker.waiting:
+	case <-time.After(time.Second):
+		t.Fatal("publisher did not receive RUNNING")
+	}
+	second := outcome("two")
+	for _, run := range []struct {
+		done <-chan string
+		want string
+	}{{first, "first"}, {second, "second"}} {
+		select {
+		case value := <-run.done:
+			assert.Equal(t, run.want, value)
+		case <-time.After(time.Second):
+			t.Fatalf("trigger %q blocked on MQTT", run.want)
+		}
+	}
+}

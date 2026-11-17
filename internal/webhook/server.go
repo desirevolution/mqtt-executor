@@ -36,9 +36,10 @@ const maxBodySize = 1 << 20 // 1 MiB
 type Server struct {
 	http.Server
 
-	Trigger   *mqtt.Trigger
-	Sensor    *mqtt.SensorWorker
-	startedAt time.Time
+	Trigger       *mqtt.Trigger
+	Sensor        *mqtt.SensorWorker
+	MQTTConnected func() bool
+	startedAt     time.Time
 }
 
 type triggerRequest struct {
@@ -168,6 +169,11 @@ func (s *Server) handleTriggerStop(w http.ResponseWriter, r *http.Request) {
 // handleSensorQuery runs the named sensor's command synchronously. The output
 // is also published to MQTT (if a broker is present).
 func (s *Server) handleSensor(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodHead {
+		w.Header().Set("Allow", http.MethodGet)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	name := r.PathValue("name")
 
 	output, err := s.Sensor.ExecuteOnce(r.Context(), name)
@@ -175,7 +181,7 @@ func (s *Server) handleSensor(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, mqtt.ErrUnknownSensor):
 		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown sensor %q", name))
 	case err != nil:
-		//the failed result was already published (shared semantics)
+		// MQTT feedback is handled separately by the sensor worker.
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, "%s%s", mqtt.PayloadResultFailedPrefix, err.Error())
@@ -187,8 +193,16 @@ func (s *Server) handleSensor(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	mqttStatus := "disabled"
+	if s.MQTTConnected != nil {
+		mqttStatus = "disconnected"
+		if s.MQTTConnected() {
+			mqttStatus = "connected"
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok",
+		"mqtt":   mqttStatus,
 		"uptime": time.Since(s.startedAt).Round(time.Second).String(),
 	})
 }

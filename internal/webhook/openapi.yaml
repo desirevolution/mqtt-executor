@@ -156,7 +156,9 @@ paths:
       description: |
         Starts or joins an active measurement and returns its output. A
         configured MQTT result topic receives the output even when a
-        publish_on_change check would otherwise skip it.
+        publish_on_change check would otherwise skip it. HTTP returns once
+        the measurement finishes, which may be before MQTT delivery.
+        HEAD is rejected without starting a measurement.
       parameters:
         - name: name
           in: path
@@ -185,7 +187,7 @@ paths:
                 type: string
   /status:
     get:
-      summary: Health/readiness probe
+      summary: Liveness and MQTT connection status
       responses:
         '200':
           description: Server is up
@@ -197,6 +199,9 @@ paths:
                   status:
                     type: string
                     example: ok
+                  mqtt:
+                    type: string
+                    enum: [disabled, disconnected, connected]
                   uptime:
                     type: string
                     example: 1h2m3s

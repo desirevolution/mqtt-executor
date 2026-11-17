@@ -21,6 +21,7 @@ import (
 
 var commandExecutor *cmd.CommandExecutor
 var statusWorker mqtt.StatusWorker
+var triggerPublisher *transport.BufferedPublisher
 var sensorWorker mqtt.SensorWorker
 var trigger mqtt.Trigger
 var webServer *webhook.Server
@@ -53,45 +54,20 @@ func main() {
 	signal.Notify(reloadSignals, syscall.SIGHUP)
 
 	var client MQTT.Client
-	var publisher transport.Publisher
+	var publisher transport.Publisher = transport.NopPublisher{}
 	if *Config.Broker != "" {
-		client = MQTT.NewClient(Config.GetMQTTOpts(
-			handleOnConnection,
-			handleOnConnectionLost,
-		))
+		client = MQTT.NewClient(Config.GetMQTTOpts(handleOnConnection, handleOnConnectionLost))
 		publisher = transport.NewMQTTPublisher(client)
+		triggerPublisher = transport.NewBufferedPublisher(publisher, client.IsConnectionOpen, 256)
+		trigger.Publisher = triggerPublisher
 		trigger.MqttClient = client
 		sensorWorker.MqttClient = client
-
-		if token := client.Connect(); token.Wait() && token.Error() != nil {
-			fatal("Error while connecting to mqtt broker", "error", token.Error())
-		}
+		statusWorker.Availability = Config.TopicConfigurations.Availability
 	} else {
-		//webhook-only mode: trigger/sensor results are only available through
-		//the ingress (see ticket 06), publishes are discarded
-		publisher = transport.NopPublisher{}
+		trigger.Publisher = publisher
 	}
 	statusWorker.Publisher = publisher
-	trigger.Publisher = publisher
 	sensorWorker.Publisher = publisher
-
-	//if hassio is enabled -> publish the hassio mqtt-discovery configs
-	//(broker mode only, see LoadConfig validation)
-	if *Config.HomeassistantEnable && client != nil {
-		haClient := hassio.Client{
-			DeviceName:  *Config.DeviceName,
-			DeviceId:    *Config.DeviceId,
-			TopicPrefix: *Config.HomeassistantTopic,
-			Publisher:   publisher,
-		}
-		if err := haClient.PublishDiscoveryConfig(Config.TopicConfigurations); err != nil {
-			slog.Error("Error while publishing homeassistant discovery config", "error", err)
-		}
-	}
-
-	if Config.TopicConfigurations.Availability != nil && client != nil {
-		statusWorker.Initialise(*Config.TopicConfigurations.Availability)
-	}
 
 	//register trigger and sensors
 	workerLifecycle.Lock()
@@ -100,6 +76,9 @@ func main() {
 
 	//webhook server: synchronous HTTP ingress next to MQTT
 	webServer = webhook.NewServer(*Config.WebAddress, &trigger, &sensorWorker, startTime)
+	if client != nil {
+		webServer.MQTTConnected = client.IsConnectionOpen
+	}
 	if *Config.WebAddress != "" {
 		if host, _, err := net.SplitHostPort(*Config.WebAddress); err == nil {
 			switch host {
@@ -115,6 +94,12 @@ func main() {
 			}
 		}()
 	}
+	if client != nil {
+		// Paho retries the initial connection in the background. Local workers
+		// and HTTP are already ready to serve requests.
+		slog.Info("Connecting to MQTT broker in background")
+		client.Connect()
+	}
 
 	//wait for shutdown signal or config reload
 	for {
@@ -123,14 +108,14 @@ func main() {
 			shutdown(client)
 			return
 		case <-reloadSignals:
-			handleReload(client, publisher)
+			handleReload(client)
 		}
 	}
 }
 
 // handleReload applies a configuration reload on SIGHUP. On any validation
 // error the reload is aborted and the old configuration stays active.
-func handleReload(client MQTT.Client, publisher transport.Publisher) {
+func handleReload(client MQTT.Client) {
 	slog.Info("SIGHUP received. Reloading configuration...")
 
 	configuration, err := loadReloadConfig()
@@ -148,42 +133,50 @@ func handleReload(client MQTT.Client, publisher transport.Publisher) {
 	//its timeout, the worker's waiter goroutine lingers until the next Close
 	//(commands are process-group killed, so this is a rare edge)
 	if err := sensorWorker.Close(20 * time.Second); err != nil {
-		slog.Warn("Timeout while stopping sensor worker", "error", err)
+		slog.Warn("Failed to stop sensor worker cleanly", "error", err)
 	}
 	if err := trigger.Close(20 * time.Second); err != nil {
-		slog.Warn("Timeout while stopping trigger worker", "error", err)
+		slog.Warn("Failed to stop trigger worker cleanly", "error", err)
 	}
 
 	//swap the active configuration and restart the workers
 	Config.TopicConfigurations = configuration
 	applyWorkerConfig()
 
-	//refresh the homeassistant discovery for new/changed entities (broker mode)
-	if *Config.HomeassistantEnable && client != nil {
-		haClient := hassio.Client{
-			DeviceName:  *Config.DeviceName,
-			DeviceId:    *Config.DeviceId,
-			TopicPrefix: *Config.HomeassistantTopic,
-			Publisher:   publisher,
-		}
-		if err := haClient.PublishDiscoveryConfig(Config.TopicConfigurations); err != nil {
-			slog.Error("Error while publishing homeassistant discovery config", "error", err)
-		}
+	if client != nil && client.IsConnectionOpen() {
+		publishDiscovery()
 	}
-
 	slog.Info("Configuration reloaded.")
+}
+
+func publishDiscovery() {
+	if !*Config.HomeassistantEnable {
+		return
+	}
+	haClient := hassio.Client{
+		DeviceName:  *Config.DeviceName,
+		DeviceId:    *Config.DeviceId,
+		TopicPrefix: *Config.HomeassistantTopic,
+		Publisher:   statusWorker.Publisher,
+	}
+	if err := haClient.PublishDiscoveryConfig(Config.TopicConfigurations); err != nil {
+		slog.Error("Error while publishing homeassistant discovery config", "error", err)
+	}
 }
 
 var handleOnConnection = func(client MQTT.Client) {
 	workerLifecycle.Lock()
 	defer workerLifecycle.Unlock()
-	if workersStopped || !trigger.IsInitialised() {
+	if workersStopped || !client.IsConnectionOpen() {
 		return
 	}
 
-	slog.Info("Reinitialise...")
+	slog.Info("MQTT connected")
+	triggerPublisher.Reset()
 	trigger.ReInitialise()
 	sensorWorker.ReInitialise(byte(*Config.SubscribeQOS))
+	statusWorker.Online()
+	publishDiscovery()
 }
 
 var handleOnConnectionLost = func(client MQTT.Client, err error) {
@@ -199,7 +192,7 @@ func shutdown(client MQTT.Client) {
 	type closable interface {
 		Close(time.Duration) error
 	}
-	closeables := []closable{&statusWorker, &sensorWorker, &trigger, webServer, commandExecutor}
+	closeables := []closable{&sensorWorker, &trigger, webServer, commandExecutor}
 
 	//most operating systems wait a maximum of 30 seconds
 
@@ -220,6 +213,12 @@ func shutdown(client MQTT.Client) {
 
 	//we have to disconnect at last because one closeable unsubscripe all topics
 	if client != nil {
-		client.Disconnect(10 * 1000) //wait 10sek at most
+		if err := triggerPublisher.Close(2 * time.Second); err != nil {
+			slog.Warn("MQTT trigger updates could not be flushed", "error", err)
+		}
+		if client.IsConnectionOpen() {
+			statusWorker.Offline()
+		}
+		client.Disconnect(1000)
 	}
 }

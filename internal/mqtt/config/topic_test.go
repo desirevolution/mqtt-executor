@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -466,4 +467,22 @@ func TestTriggerWebhookIDsAndDormantRunTopic(t *testing.T) {
 	require.ErrorContains(t, conf.validate(), "duplicate webhook_id")
 	conf.Trigger[0].WebhookID = "Upper/Two"
 	require.ErrorContains(t, conf.validate(), "invalid webhook_id")
+}
+
+func TestExpandedMQTTCommandTopicCollision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+trigger:
+  - name: Timer
+    topic: cmnd/__DEVICE_ID__/run
+    command: {name: /bin/true}
+  - name: Bell
+    topic: cmnd/notebook/run
+    command: {name: /bin/true}
+`), 0o600))
+
+	_, err := LoadTopicConfiguration(path, "notebook")
+	require.ErrorContains(t, err, "cmnd/notebook/run")
+	require.ErrorContains(t, err, "Timer")
+	require.ErrorContains(t, err, "Bell")
 }

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -382,4 +383,48 @@ func TestRootRedirectsToDocsOnly(t *testing.T) {
 	handler.ServeHTTP(unknown, httptest.NewRequest(http.MethodGet, "/missing", nil))
 	assert.Equal(t, http.StatusNotFound, unknown.Code)
 	assert.Empty(t, unknown.Header().Get("Location"))
+}
+
+func TestSensorHeadDoesNotExecuteCommand(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "measured")
+	sensor := &mqtt.SensorWorker{Executor: cmd.NewCommandExecutor(), Publisher: transport.NopPublisher{}}
+	sensor.Initialise(1, []config.GeneralSensor{{
+		Name: "probe", Command: config.Command{Name: "/bin/touch", Arguments: []string{marker}},
+	}})
+	t.Cleanup(func() { assert.NoError(t, sensor.Close(time.Second)) })
+	handler := NewServer("", &mqtt.Trigger{}, sensor, time.Now()).Handler
+
+	head := httptest.NewRecorder()
+	handler.ServeHTTP(head, httptest.NewRequest(http.MethodHead, "/sensor/probe", nil))
+	assert.Equal(t, http.StatusMethodNotAllowed, head.Code)
+	assert.Equal(t, "GET", head.Header().Get("Allow"))
+	assert.NoFileExists(t, marker)
+
+	get := httptest.NewRecorder()
+	handler.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/sensor/probe", nil))
+	assert.Equal(t, http.StatusOK, get.Code)
+	assert.FileExists(t, marker)
+}
+
+func TestStatusReportsMQTTConnection(t *testing.T) {
+	server := NewServer("", &mqtt.Trigger{}, &mqtt.SensorWorker{}, time.Now())
+	for _, test := range []struct {
+		state     string
+		connected func() bool
+	}{
+		{"disabled", nil},
+		{"disconnected", func() bool { return false }},
+		{"connected", func() bool { return true }},
+	} {
+		t.Run(test.state, func(t *testing.T) {
+			server.MQTTConnected = test.connected
+			response := httptest.NewRecorder()
+			server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/status", nil))
+			require.Equal(t, http.StatusOK, response.Code)
+			var status map[string]string
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &status))
+			assert.Equal(t, "ok", status["status"])
+			assert.Equal(t, test.state, status["mqtt"])
+		})
+	}
 }

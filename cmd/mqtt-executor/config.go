@@ -30,6 +30,7 @@ type applicationConfig struct {
 
 	LogFormat   *string
 	ShowVersion *bool
+	CheckConfig *bool
 
 	TopicConfigFile     *string
 	TopicConfigurations internalConf.TopicConfigurations
@@ -58,6 +59,7 @@ func LoadConfig() {
 		WebAddress:          flag.String("web", "127.0.0.1:8080", "The webhook server listen address (optional, empty disables the server)"),
 		LogFormat:           flag.String("log-format", "text", "The log format: text or json (optional)"),
 		ShowVersion:         flag.Bool("version", false, "Print the version and exit"),
+		CheckConfig:         flag.Bool("check-config", false, "Validate configuration and executable paths, then exit"),
 		TopicConfigFile:     flag.String("config", "./config.yaml", "The topic configuration file"),
 	}
 	flag.Parse()
@@ -91,6 +93,10 @@ func LoadConfig() {
 		fatal(err.Error())
 	}
 	Config.TopicConfigurations = configuration
+	if *Config.CheckConfig {
+		fmt.Println("Configuration OK")
+		os.Exit(0)
+	}
 
 	//webhook-only mode: features without a publish target are disabled
 	if *Config.Broker == "" {
@@ -141,6 +147,8 @@ func (c *applicationConfig) GetMQTTOpts(
 
 	opts := MQTT.NewClientOptions()
 	opts.SetWriteTimeout(5 * time.Second)
+	opts.SetConnectRetry(true)
+	opts.SetConnectRetryInterval(2 * time.Second)
 
 	opts.AddBroker(*c.Broker)
 	if *c.Username != "" {

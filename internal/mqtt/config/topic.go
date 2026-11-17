@@ -293,39 +293,52 @@ func validateTrigger(trigger Trigger) error {
 	return nil
 }
 
-// New request topics must be distinct from each other and from any existing
-// ingress or publication topic. A collision could make a publish run commands.
+// Command and request topics must be distinct and cannot overlap with a
+// publication topic. Several sensors may still share an output topic.
 func (t *TopicConfigurations) validateRequestTopics() error {
-	used := make(map[string]bool)
+	used := make(map[string]string)
 	if t.Availability != nil {
-		used[t.Availability.Topic] = true
+		used[t.Availability.Topic] = "availability"
+	}
+	for _, trigger := range t.Trigger {
+		if trigger.Topic != "" {
+			used[trigger.Topic+"/STATE"] = fmt.Sprintf("STATE for trigger %q", trigger.Name)
+			used[trigger.Topic+"/RESULT"] = fmt.Sprintf("RESULT for trigger %q", trigger.Name)
+		}
+	}
+	sensors := t.Sensors()
+	for _, sensor := range sensors {
+		if sensor.ResultTopic != "" {
+			used[sensor.ResultTopic] = fmt.Sprintf("result for sensor %q", sensor.Name)
+		}
+	}
+
+	claim := func(topic, owner string) error {
+		if previous, ok := used[topic]; ok {
+			return fmt.Errorf("MQTT topic %q is already used by %s and cannot be used by %s", topic, previous, owner)
+		}
+		used[topic] = owner
+		return nil
 	}
 	for _, trigger := range t.Trigger {
 		if trigger.Topic == "" {
 			continue
 		}
-		used[trigger.Topic] = true
-		used[trigger.Topic+"/STATE"] = true
-		used[trigger.Topic+"/RESULT"] = true
-	}
-	sensors := t.Sensors()
-	for _, sensor := range sensors {
-		used[sensor.ResultTopic] = true
-	}
-	for _, trigger := range t.Trigger {
-		if trigger.Topic == "" || trigger.RunTopic == "" {
-			continue
+		if err := claim(trigger.Topic, fmt.Sprintf("command for trigger %q", trigger.Name)); err != nil {
+			return err
 		}
-		if used[trigger.RunTopic] {
-			return fmt.Errorf("run_topic %q is already used", trigger.RunTopic)
+		if trigger.RunTopic != "" {
+			if err := claim(trigger.RunTopic, fmt.Sprintf("run_topic for trigger %q", trigger.Name)); err != nil {
+				return err
+			}
 		}
-		used[trigger.RunTopic] = true
 	}
 	for _, sensor := range sensors {
-		if sensor.QueryTopic != "" && used[sensor.QueryTopic] {
-			return fmt.Errorf("query_topic %q is already used", sensor.QueryTopic)
+		if sensor.QueryTopic != "" {
+			if err := claim(sensor.QueryTopic, fmt.Sprintf("query_topic for sensor %q", sensor.Name)); err != nil {
+				return err
+			}
 		}
-		used[sensor.QueryTopic] = true
 	}
 	return nil
 }

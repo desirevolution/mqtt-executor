@@ -79,8 +79,10 @@ func (t *Trigger) Initialise(subscribeQOS, publishQOS byte, configs []config.Tri
 
 // ReInitialise restores subscriptions and reports the current state on reconnect.
 func (t *Trigger) ReInitialise() {
+	if t.MqttClient != nil && !t.MqttClient.IsConnectionOpen() {
+		return
+	}
 	t.statusMu.Lock()
-	defer t.statusMu.Unlock()
 
 	t.lock.RLock()
 	subscriptions := t.subscriptions
@@ -101,6 +103,7 @@ func (t *Trigger) ReInitialise() {
 	for topic, state := range states {
 		t.publish(topic+"/"+TopicSuffixState, pubQOS, state)
 	}
+	t.statusMu.Unlock()
 	if t.MqttClient != nil {
 		for topic, handler := range subscriptions {
 			t.MqttClient.Subscribe(topic, subQOS, handler)
@@ -319,17 +322,29 @@ func (t *Trigger) publishTrigger(name, suffix string, payload any) {
 	}
 }
 
-func (t *Trigger) Close(_ time.Duration) error {
+func (t *Trigger) Close(timeout time.Duration) error {
 	t.lock.Lock()
 	subscriptions := t.subscriptions
 	t.subscriptions = nil
 	t.generation++
 	t.lock.Unlock()
 
-	if t.MqttClient != nil {
-		for topic := range subscriptions {
-			t.MqttClient.Unsubscribe(topic)
-		}
+	topics := make([]string, 0, len(subscriptions))
+	for topic := range subscriptions {
+		topics = append(topics, topic)
 	}
-	return nil
+	return unsubscribe(t.MqttClient, topics, timeout)
+}
+
+// Wait for the broker to remove the old subscriptions before a reload can
+// register new handlers on the same topics.
+func unsubscribe(client MQTT.Client, topics []string, timeout time.Duration) error {
+	if client == nil || len(topics) == 0 || !client.IsConnectionOpen() {
+		return nil
+	}
+	token := client.Unsubscribe(topics...)
+	if !token.WaitTimeout(min(timeout, 5*time.Second)) {
+		return errors.New("timed out waiting for MQTT unsubscription")
+	}
+	return token.Error()
 }

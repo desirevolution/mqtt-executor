@@ -43,6 +43,7 @@ type configuredSensor struct {
 }
 
 type measurement struct {
+	ready  chan struct{}
 	done   chan struct{}
 	manual bool
 	output []byte
@@ -77,7 +78,7 @@ func (s *SensorWorker) Initialise(publishQOS byte, configs []config.GeneralSenso
 
 func (s *SensorWorker) ReInitialise(subscribeQOS byte) {
 	session := s.currentSession()
-	if s.MqttClient == nil || session == nil {
+	if s.MqttClient == nil || session == nil || !s.MqttClient.IsConnectionOpen() {
 		return
 	}
 	for topic, sensor := range session.topics {
@@ -130,7 +131,7 @@ func (s *SensorWorker) measure(session *sensorSession, sensor *configuredSensor,
 		run.manual = run.manual || manual
 		return run
 	}
-	run := &measurement{done: make(chan struct{}), manual: manual}
+	run := &measurement{ready: make(chan struct{}), done: make(chan struct{}), manual: manual}
 	sensor.active = run
 	session.workers.Go(func() { s.completeMeasurement(session, sensor, run) })
 	return run
@@ -153,6 +154,7 @@ func (s *SensorWorker) completeMeasurement(session *sensorSession, sensor *confi
 	}
 
 	session.mu.Lock()
+	close(run.ready) // HTTP readers can return before the MQTT acknowledgement.
 	publish := session.ctx.Err() == nil && conf.ResultTopic != "" &&
 		(run.manual || !conf.PublishOnChange || !sensor.hasPublished || string(payload) != sensor.lastPublished)
 	if publish {
@@ -186,12 +188,13 @@ func (s *SensorWorker) ExecuteOnce(ctx context.Context, name string) ([]byte, er
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-run.done:
+	case <-run.ready:
 		return run.output, run.err
 	}
 }
 
 func (s *SensorWorker) Close(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
 	s.mu.Lock()
 	session := s.session
 	s.session = nil
@@ -203,11 +206,11 @@ func (s *SensorWorker) Close(timeout time.Duration) error {
 	session.mu.Lock()
 	session.cancel()
 	session.mu.Unlock()
-	if s.MqttClient != nil {
-		for topic := range session.topics {
-			s.MqttClient.Unsubscribe(topic)
-		}
+	topics := make([]string, 0, len(session.topics))
+	for topic := range session.topics {
+		topics = append(topics, topic)
 	}
+	unsubscribeErr := unsubscribe(s.MqttClient, topics, time.Until(deadline))
 
 	done := make(chan struct{})
 	go func() {
@@ -216,8 +219,8 @@ func (s *SensorWorker) Close(timeout time.Duration) error {
 	}()
 	select {
 	case <-done:
-		return nil
-	case <-time.After(timeout):
-		return errors.New("timeout exceeded")
+		return unsubscribeErr
+	case <-time.After(time.Until(deadline)):
+		return errors.Join(unsubscribeErr, errors.New("timeout exceeded"))
 	}
 }

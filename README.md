@@ -116,8 +116,8 @@ Notes:
 - Omit `interval` for an on-demand sensor. A single HTTP-only sensor needs
   only `name` and `command`. Periodic sensors and MQTT queries need a result
   `topic`; periodic sensors also need a configured broker.
-- Choose distinct MQTT request topics. They must not match existing command,
-  availability, or result topics.
+- MQTT command and request topics must be unique and must not match any
+  availability, state, or result topic.
 
 # Usage
 
@@ -128,6 +128,9 @@ mqtt-executor -broker tcp://127.0.0.1:1883 -config /path/to/config.yaml
 # webhook-only mode (no MQTT)
 mqtt-executor -config /path/to/config.yaml
 
+# validate YAML, topics and executable paths without starting the daemon
+mqtt-executor -check-config -broker tcp://127.0.0.1:1883 -config /path/to/config.yaml
+
 # home assistant discovery (broker mode only)
 mqtt-executor -broker tcp://127.0.0.1:1883 -config /path/to/config.yaml -home-assistant
 ```
@@ -136,6 +139,7 @@ mqtt-executor -broker tcp://127.0.0.1:1883 -config /path/to/config.yaml -home-as
 |---|---|---|
 | `-broker` | *(empty)* | Broker URI. **Optional** — empty means webhook-only mode. Triggers and on-demand HTTP sensors work without a broker. Periodic sensors require a broker. |
 | `-config` | `./config.yaml` | Topic configuration file (YAML). |
+| `-check-config` | `false` | Validate configuration, including the selected broker mode and command paths, and exit. |
 | `-web` | `127.0.0.1:8080` | Webhook listen address. Specify a LAN address for access from another machine. An empty value disables HTTP. |
 | `-sub-qos` / `-pub-qos` | `1` / `1` | MQTT QoS levels (0, 1, 2). |
 | `-user` / `-password` | *(empty)* | MQTT credentials. |
@@ -174,7 +178,7 @@ curl -X DELETE 'http://127.0.0.1:8080/trigger/touch-file'
 # run a sensor command on demand (also published to MQTT, if broker)
 curl 'http://127.0.0.1:8080/sensor/Free%20Memory'
 
-# health + prometheus metrics
+# liveness, MQTT connection status, and Prometheus metrics
 curl http://127.0.0.1:8080/status
 curl http://127.0.0.1:8080/metrics
 ```
@@ -184,7 +188,13 @@ The synchronous start returns `200` when finished or interrupted.
 ID. Both start routes accept an optional raw body (up to 1 MiB) and report
 `404` for unknown triggers or `409` while an execution is active. A failing
 command returns `500` with `<FAILED>;` on synchronous calls. A trigger timeout
-returns `<INTERRUPTED>`; a sensor timeout is a measurement failure.
+returns `<INTERRUPTED>`; a sensor timeout is a measurement failure. Use GET for
+sensor queries. HEAD returns `405` without measuring.
+
+`GET /status` remains a liveness probe. Its `mqtt` field is `disabled`,
+`disconnected`, or `connected`. If a configured broker is unavailable at
+startup, the daemon keeps serving HTTP and retries the MQTT connection in
+the background.
 
 # MQTT semantics (broker mode)
 
@@ -214,6 +224,13 @@ mosquitto_pub -t cmnd/memory/query -n
   stdin. The existing command topic still passes the `START` message.
 - A trigger holds its execution slot until the current run completes,
   including after a stop request. Further MQTT impulses are dropped.
+- Trigger feedback is sent in order through a bounded background queue.
+  A slow broker does not hold up command execution or HTTP responses. Updates
+  can be dropped while offline or when the queue is full. Pending updates
+  are cleared on reconnect, and the current trigger state is published again.
+  Configured MQTT availability is published online after every connection.
+- Sensor HTTP responses return once the measurement finishes. The MQTT
+  result may still be awaiting delivery.
 - Publish command, impulse, and query messages without retain. Replayed
   retained requests are ignored when subscribing or reconnecting.
 - HTTP, MQTT and interval requests share an active sensor measurement.
